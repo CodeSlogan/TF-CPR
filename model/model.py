@@ -52,4 +52,4 @@ class Model(nn.Module):
         
         if is_train:
             return bp_pred, ecg_restore, ppg_restore
-        return bp_pred
+        return bp_pred, 0.0, 0.0

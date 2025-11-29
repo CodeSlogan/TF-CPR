@@ -1,13 +1,55 @@
 import torch
 import torch.nn as nn
-
+import torch.nn.functional as F
 class PatchEmbedding(nn.Module):
-    def __init__(self, in_c=1, d_model=128, patch_size=30):
+    """
+    时域切分: 将连续信号切分为 Token, 并注入位置信息
+    Input: [B, 1, L] -> Output: [B, N, D]
+    """
+    def __init__(self, in_channels=1, d_model=128, patch_size=30, max_len=3000, dropout=0.1):
         super().__init__()
-        self.proj = nn.Conv1d(in_c, d_model, patch_size, stride=patch_size)
+        self.patch_size = patch_size
         
+        # 1. Patching 
+        # stride=patch_size 实现了无重叠切分
+        self.proj = nn.Conv1d(in_channels, d_model, kernel_size=patch_size, stride=patch_size)
+        
+        # 2. Position Embedding (关键修改)
+        # 计算最大可能的 Token 数量。例如信号长 3000，patch 30，则有 100 个 Token
+        max_tokens = max_len // patch_size + 1 
+        
+        # [1, Max_Tokens, D_Model]
+        self.pos_embed = nn.Parameter(torch.randn(1, max_tokens, d_model) * 0.02)
+        
+        # 3. Dropout 
+        self.dropout = nn.Dropout(dropout)
+
     def forward(self, x):
-        return self.proj(x).transpose(1, 2)
+        """
+        x: [B, 1, L] 原始信号
+        """
+        # Step 1: Patch Projection
+        x = self.proj(x)      # [B, D, N]
+        x = x.transpose(1, 2) # [B, N, D]
+        
+        B, N, D = x.shape
+        
+        # Step 2: Add Position Embedding
+        # pos_embed 是 [1, Max_Tokens, D]，自动广播到 Batch 维
+        if N > self.pos_embed.shape[1]:
+            # 如果输入异常过长（超过预设 max_len），使用插值进行调整（鲁棒性处理）
+            # 这种情况极少发生，但在工程上要防止 Crash
+            pos_resized = F.interpolate(
+                self.pos_embed.transpose(1, 2), size=N, mode='linear'
+            ).transpose(1, 2)
+            x = x + pos_resized
+        else:
+            x = x + self.pos_embed[:, :N, :]
+            
+        # Step 3: Dropout
+        x = self.dropout(x)
+        
+        return x
 
 
 class FrequencyModule(nn.Module):
@@ -89,7 +131,6 @@ class ALMR(nn.Module):
         beats, attn_map = self.attn_token2beat(q_beat, x_token, x_token)
         
         # --- ALMR 计算 (在内部完成) ---
-        
         # A. 解码 Beat 原型: [B, K, D] -> [B, K, P]
         beat_prototypes = self.almr_decoder(beats)
         

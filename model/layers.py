@@ -3,50 +3,53 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class BPBookMemory(nn.Module):
-    """
-    (Memory Bank) - Key Component.
-    Query -> Cosine Sim -> TopK -> Weighted Sum -> Residual Add
-    """
     def __init__(self, num_slots=1024, d_model=128, topk=5):
         super().__init__()
         self.d_model = d_model
         self.topk = topk
-        
-        # 初始化为正态分布，随网络一起训练更新
         self.memory = nn.Parameter(torch.randn(num_slots, d_model))
-        
-        # 可选：一个可学习的缩放因子，控制检索信息融入的强度
-        self.retrieval_scale = nn.Parameter(torch.tensor(0.1))
+        self.retrieval_scale = nn.Parameter(torch.tensor(0.05))
+
+        # --- 新增：用于全局特征提取的 CNN 模块 ---
+        # 目的：在平均前，先用 learnable filters 提取高级时序模式
+        self.global_extractor = nn.Sequential(
+            # Conv1d 必须以 [B, C, L] 形式输入，所以 C=D_model, L=N
+            # 简化起见，我们使用一个 1x1 卷积和非线性层，用于特征压缩和融合
+            nn.Conv1d(d_model, d_model, kernel_size=1),
+            nn.GELU(),
+            # 可以根据需要添加更多层或使用更大的 kernel size (e.g., 3)
+        )
 
     def forward(self, x):
         """
-        x: [Batch, Seq_Len, D_Model]
+        x: [Batch, N, D_Model]
         """
         B, N, D = x.shape
         
-        # 1. 归一化以计算余弦相似度
-        x_norm = F.normalize(x, dim=-1)
+        x_conv = x.transpose(1, 2) # [B, D, N]
+        x_feat = self.global_extractor(x_conv)
+        
+        # 2. Global Average Pooling (得到全局 Query)
+        # [B, D, N] -> [B, D]
+        x_global_query = x_feat.mean(dim=2) 
+        
+        # 3. 归一化并计算相似度 (后续步骤与之前一致)
+        x_norm = F.normalize(x_global_query, dim=-1)
         mem_norm = F.normalize(self.memory, dim=-1)
         
-        # 2. 计算相似度矩阵: [B, N, Slots]
-        sim_matrix = torch.matmul(x_norm, mem_norm.t())
+        sim_matrix = torch.matmul(x_norm, mem_norm.t()) # [B, Slots]
         
-        # 3. Top-K 检索
+        # 4. 检索、加权聚合
         topk_scores, topk_indices = torch.topk(sim_matrix, self.topk, dim=-1)
+        attention_weights = F.softmax(topk_scores, dim=-1) # [B, K]
         
-        # 4. 重新归一化 TopK 分数作为权重 (Softmax)
-        attention_weights = F.softmax(topk_scores, dim=-1) # [B, N, K]
-        
-        # 5. 从 Memory 中 gather 向量
         flat_indices = topk_indices.view(-1)
-        retrieved_vectors = F.embedding(flat_indices, self.memory)
-        retrieved_vectors = retrieved_vectors.view(B, N, self.topk, D)
+        retrieved_vectors = F.embedding(flat_indices, self.memory).view(B, self.topk, D)
         
-        # 6. 加权聚合
-        weighted_retrieval = (retrieved_vectors * attention_weights.unsqueeze(-1)).sum(dim=2)
+        global_prototype = (retrieved_vectors * attention_weights.unsqueeze(-1)).sum(dim=1) # [B, D]
         
-        # 7. 残差连接
-        return x + self.retrieval_scale * weighted_retrieval
+        # 5. 广播残差连接
+        return x + self.retrieval_scale * global_prototype.unsqueeze(1)
 
 
 class TransformerBPBookLayer(nn.Module):
