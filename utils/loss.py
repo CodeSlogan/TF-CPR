@@ -34,8 +34,7 @@ def complex_loss(ecg_raw, ppg_raw, abp_raw,
         ecg_target = ecg_raw.squeeze(-1) if ecg_raw.dim() == 3 else ecg_raw
         ppg_target = ppg_raw.squeeze(-1) if ppg_raw.dim() == 3 else ppg_raw
         
-        B, N, P = ecg_pred.shape
-        target_len = N * P
+        B, target_len = ecg_pred.shape
         
         # 长度适配
         if ecg_target.shape[1] > target_len:
@@ -46,8 +45,8 @@ def complex_loss(ecg_raw, ppg_raw, abp_raw,
             ecg_target = F.pad(ecg_target, (0, pad_len))
             ppg_target = F.pad(ppg_target, (0, pad_len))
             
-        ecg_target_reshaped = ecg_target.view(B, N, P)
-        ppg_target_reshaped = ppg_target.view(B, N, P)
+        ecg_target_reshaped = ecg_target.view(B, target_len)
+        ppg_target_reshaped = ppg_target.view(B, target_len)
         
         loss_almr_ecg = F.mse_loss(ecg_pred, ecg_target_reshaped)
         loss_almr_ppg = F.mse_loss(ppg_pred, ppg_target_reshaped)

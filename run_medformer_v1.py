@@ -9,11 +9,10 @@ import sys
 from tqdm import tqdm
 import datetime
 
-
 from utils.data_factory import DataFactory, DataConfig, denormalize_abp
 from utils.loss import complex_loss
 from utils.earlystop import EarlyStopping
-from model import Model
+from baseline.medformer_v1.Medformer import Medformer
 
 
 def get_args():
@@ -27,17 +26,61 @@ def get_args():
     parser.add_argument('--data_root', type=str, default='./dataset/mimicbp', help='Data root directory')
     parser.add_argument('--original_length', type=int, default=3750, help='Raw NPY file row length')
     parser.add_argument('--seq_len', type=int, default=625, help='Input window size (slicing length)')
+    parser.add_argument(
+    "--pred_len", type=int, default=625, help="prediction sequence length"
+    )
     parser.add_argument('--stride', type=int, default=625, help='Sliding window stride')
     parser.add_argument('--train_ratio', type=float, default=0.7, help='Train set ratio')
     parser.add_argument('--val_ratio', type=float, default=0.1, help='Validation set ratio')
     parser.add_argument('--num_workers', type=int, default=4, help='DataLoader workers')
 
     # --- 2.2 Model Architecture ---
-    parser.add_argument('--d_model', type=int, default=256, help='Embedding dimension')
-    parser.add_argument('--num_layers', type=int, default=12, help='Number of Transformer layers')
-    parser.add_argument('--nhead', type=int, default=8, help='Number of attention heads')
-    parser.add_argument('--patch_size', type=int, default=25, help='Patch size for embedding')
-    parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate')
+    parser.add_argument('--topK', type=int, default=12, help='Top-K for BP-Book retrieval')
+    parser.add_argument('--num_prototypes', type=int, default=1024, help='Number of prototypes for BP-Book')
+    parser.add_argument("--cwt_channels", type=int, default=32, help="cwt channels")
+    parser.add_argument("--d_model", type=int, default=256, help="dimension of model")
+    parser.add_argument("--n_heads", type=int, default=8, help="num of heads")
+    parser.add_argument("--e_layers", type=int, default=12, help="num of encoder layers")
+    parser.add_argument("--d_ff", type=int, default=512, help="dimension of fcn")
+    parser.add_argument("--factor", type=int, default=1, help="attn factor")
+
+    parser.add_argument("--dropout", type=float, default=0.1, help="dropout")
+    parser.add_argument(
+        "--embed",
+        type=str,
+        default="timeF",
+        help="time features encoding, options:[timeF, fixed, learned]",
+    )
+    parser.add_argument("--activation", type=str, default="gelu", help="activation")
+    parser.add_argument(
+        "--output_attention",
+        action="store_true",
+        help="whether to output attention in encoder",
+    )
+    parser.add_argument(
+        "--no_inter_attn",
+        action="store_true",
+        help="whether to use inter-attention in encoder, using this argument means not using inter-attention",
+        default=False,
+    )
+    parser.add_argument(
+        "--patch_len_list",
+        type=str,
+        default="8,8,8,16,16,16,32,32,32,64,64,64",
+        help="a list of patch len used in Medformer",
+    )
+    parser.add_argument(
+        "--single_channel",
+        action="store_true",
+        help="whether to use single channel patching for Medformer",
+        default=False,
+    )
+    parser.add_argument(
+        "--augmentations",
+        type=str,
+        default="flip,shuffle,jitter,mask,drop",
+        help="a comma-seperated list of augmentation types (none, jitter or scale). Append numbers to specify the strength of the augmentation, e.g., jitter0.1",
+    )
     
     # --- 2.3 Loss Function Weights (Lambdas) ---
     parser.add_argument('--lambda_mse', type=float, default=1.0, help='Weight for MSE Loss')
@@ -46,8 +89,8 @@ def get_args():
     parser.add_argument('--lambda_almr', type=float, default=0.1, help='Weight for ALMR Self-Supervised Loss')
 
     # --- 2.4 Training Hyperparams ---
-    parser.add_argument('--batch_size', type=int, default=128, help='Batch size')
-    parser.add_argument('--epochs', type=int, default=50, help='Number of epochs')
+    parser.add_argument('--batch_size', type=int, default=64, help='Batch size')
+    parser.add_argument('--epochs', type=int, default=500, help='Number of epochs')
     parser.add_argument('--lr', type=float, default=0.0001, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='Weight decay')
     parser.add_argument('--patience', type=int, default=10, help='Early stopping patience (epochs)') # New
@@ -73,15 +116,18 @@ def validate(model, dataloader, args, config: DataConfig, lambdas: dict, prefix=
             ecg = batch['ecg'].to(args.device).permute(0, 2, 1)
             abp = batch['abp'].to(args.device).permute(0, 2, 1)
 
-            # 在测试或验证时，确保 is_train=True 或 False 取决于你的模型是否有 dropout/masking 行为差异
-            # 通常验证时不加 masking，这里保持你原有的逻辑
-            abp_pred, ecg_rec, ppg_rec = model(ecg, ppg, is_train=args.is_train) 
 
-            loss, _ = complex_loss(ecg, ppg, abp, ecg_rec, ppg_rec, abp_pred, lambdas)
+            abp_pred, ecg_rec, ppg_rec = model(torch.concat([ecg, ppg], dim=2))
+
+            loss, loss_dict = complex_loss(
+                ecg, ppg, abp, 
+                ecg_rec, ppg_rec, abp_pred, 
+                lambdas=lambdas
+            )
             total_loss += loss.item()
 
             pred_mmhg = denormalize_abp(abp_pred, config)
-            target_mmhg = denormalize_abp(abp, config)
+            target_mmhg = denormalize_abp(abp.squeeze(), config)
             
             batch_error = pred_mmhg - target_mmhg
             all_errors.append(batch_error.detach().cpu())
@@ -104,6 +150,7 @@ def train_mode(args, model, train_loader, val_loader, loss_lambdas, data_config)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
 
     early_stopping = EarlyStopping(patience=args.patience, verbose=True, save_dir=args.save_path)
+    criterion = nn.MSELoss()
 
     print("\n--- Start Training ---")
     for epoch in range(args.epochs):
@@ -117,13 +164,15 @@ def train_mode(args, model, train_loader, val_loader, loss_lambdas, data_config)
             ppg = batch['ppg'].to(args.device).permute(0, 2, 1)
             ecg = batch['ecg'].to(args.device).permute(0, 2, 1)
             abp = batch['abp'].to(args.device).permute(0, 2, 1)
+
+            # print(ppg.shape, ecg.shape, abp.shape)
             
             optimizer.zero_grad()
             
-            abp_pred, ecg_rec, ppg_rec = model(ecg, ppg, is_train=args.is_train)
-            
+            abp_pred, ecg_rec, ppg_rec = model(torch.concat([ecg, ppg], dim=2))
+
             loss, loss_dict = complex_loss(
-                ecg, ppg, abp, 
+                ecg.squeeze(2), ppg.squeeze(2), abp.squeeze(2), 
                 ecg_rec, ppg_rec, abp_pred, 
                 lambdas=loss_lambdas
             )
@@ -136,9 +185,7 @@ def train_mode(args, model, train_loader, val_loader, loss_lambdas, data_config)
             steps += 1
             
             loop.set_postfix(
-                total=loss.item(), 
-                mse=loss_dict['mse'], 
-                deriv=loss_dict['deriv']
+                loss=loss.item()
             )
             
         scheduler.step()
@@ -225,14 +272,7 @@ def main():
     print("--- Initializing Data Pipeline ---")
     train_loader, val_loader, test_loader = DataFactory.get_dataloaders(data_config)
     
-    model = Model(
-        seq_len=args.seq_len,
-        patch_size=args.patch_size,
-        d_model=args.d_model,
-        num_layers=args.num_layers,
-        nhead=args.nhead,
-        dropout=args.dropout
-    ).to(args.device)
+    model = Medformer(args).to(args.device)
     
     if args.is_train:
         train_mode(args, model, train_loader, val_loader, loss_lambdas, data_config)
