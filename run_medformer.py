@@ -17,9 +17,10 @@ from baseline.medformer.Medformer import Medformer
 
 
 def get_args():
-    parser = argparse.ArgumentParser(description='TFCPRNet')
+    parser = argparse.ArgumentParser(description='medformer')
 
     # --- 1. Mode Selection (New) ---
+    parser.add_argument('--model_name', type=str, default="medformer", help='Model name for saving checkpoints')
     parser.add_argument('--is_train', type=bool, default=True, help='train or test')
     parser.add_argument('--test_checkpoint', type=str, default=None, help='Path to checkpoint for testing mode')
 

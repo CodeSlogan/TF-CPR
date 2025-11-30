@@ -35,9 +35,8 @@ class FreqFeatureExtractor(nn.Module):
         return v_fft, m_cwt
 
 
-class TBR_ALMR_Module(nn.Module):
+class ALMR_Module(nn.Module):
     def __init__(self, d_model, seq_len, num_beats=16, patch_num=None): 
-        # patch_num 这里不再是必须的固定值，因为我们会动态计算
         super().__init__()
         self.d_model = d_model
         self.seq_len = seq_len
@@ -233,9 +232,6 @@ class Decoder(nn.Module):
         x = self.fusion3(x)
         x = self.res3(x, fft_style)
 
-        # --- Final Alignment (参考代码的核心 trick) ---
-        # 无论之前 Upsample 到了多少 (比如 624)，这里强制插值到 target_len (625)
-        # 这保证了物理长度的绝对正确，同时保留了深层特征
         x_final = F.interpolate(x, size=self.target_len, mode='linear', align_corners=False)
         
         out = self.out_conv(x_final).squeeze(1) # (B, L)
@@ -255,23 +251,22 @@ class Medformer(nn.Module):
         self.ppg_embedding = ListPatchEmbedding(1, configs.d_model, patch_len_list, patch_len_list, configs.dropout, ["none"], True)
         self.freq_extractor = FreqFeatureExtractor(configs.seq_len, configs.d_model, configs.cwt_channels)
         
-        # TBR & ALMR
+        # ALMR
         total_patches = sum([int((configs.seq_len - pl) / pl + 2) for pl in patch_len_list])
-        self.tbr_ecg = TBR_ALMR_Module(configs.d_model, configs.seq_len, patch_num=total_patches)
-        self.tbr_ppg = TBR_ALMR_Module(configs.d_model, configs.seq_len, patch_num=total_patches)
+        self.tbr_ecg = ALMR_Module(configs.d_model, configs.seq_len, configs.num_beats, patch_num=total_patches)
+        self.tbr_ppg = ALMR_Module(configs.d_model, configs.seq_len, configs.num_beats, patch_num=total_patches)
         
-        topk = configs.topK
         self.ecg_encoder = Encoder(
             [EncoderLayer(
                 MedformerLayer(len(patch_len_list), configs.d_model, configs.n_heads, configs.dropout),
-                configs.d_model, configs.d_ff, dropout=configs.dropout, use_bp_book=True, num_prototypes=configs.num_prototypes, bp_book_topk=topk
+                configs.d_model, configs.d_ff, dropout=configs.dropout, use_bp_book=True, num_prototypes=configs.num_prototypes, bp_book_topk=configs.topK
             ) for _ in range(configs.e_layers)],
             norm_layer=nn.LayerNorm(configs.d_model)
         )
         self.ppg_encoder = Encoder(
             [EncoderLayer(
                 MedformerLayer(len(patch_len_list), configs.d_model, configs.n_heads, configs.dropout),
-                configs.d_model, configs.d_ff, dropout=configs.dropout, use_bp_book=True, num_prototypes=configs.num_prototypes, bp_book_topk=topk
+                configs.d_model, configs.d_ff, dropout=configs.dropout, use_bp_book=True, num_prototypes=configs.num_prototypes, bp_book_topk=configs.topK
             ) for _ in range(configs.e_layers)],
             norm_layer=nn.LayerNorm(configs.d_model)
         )
@@ -285,8 +280,8 @@ class Medformer(nn.Module):
             nn.GELU()
         )
         
-        # Decoder (Modularized)
-        self.decoder = Decoder(configs.d_model, configs.seq_len, configs.d_model*2, cwt_dim=32)
+        # Decoder 
+        self.decoder = Decoder(configs.d_model, configs.seq_len, configs.d_model*2, cwt_dim=configs.cwt_channels)
 
     def forward(self, x_enc):
         x_ecg = x_enc[:, :, 0] 
@@ -297,7 +292,7 @@ class Medformer(nn.Module):
         v_fft_ppg, m_cwt_ppg = self.freq_extractor(x_ppg)
         v_style = torch.cat([v_fft_ecg, v_fft_ppg], dim=-1) # (B, 2D)
         
-        # 2. Embedding & TBR
+        # 2. Embedding
         h_ecg = self.ecg_embedding(x_ecg.unsqueeze(-1))
         h_ppg = self.ppg_embedding(x_ppg.unsqueeze(-1))
         

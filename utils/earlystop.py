@@ -26,12 +26,12 @@ class EarlyStopping:
         self.save_dir = save_dir
         self.best_model_path = ""
 
-    def __call__(self, val_metric, model, optimizer, epoch, config, args):
+    def __call__(self, val_metric, model, model_name, optimizer, epoch, config, args):
         score = -val_metric 
 
         if self.best_score is None:
             self.best_score = score
-            self.save_checkpoint(val_metric, model, optimizer, epoch, config, args)
+            self.save_checkpoint(val_metric, model, model_name, optimizer, epoch, config, args)
         elif score < self.best_score + self.delta:
             self.counter += 1
             if self.verbose:
@@ -40,15 +40,15 @@ class EarlyStopping:
                 self.early_stop = True
         else:
             self.best_score = score
-            self.save_checkpoint(val_metric, model, optimizer, epoch, config, args)
+            self.save_checkpoint(val_metric, model, model_name, optimizer, epoch, config, args)
             self.counter = 0
 
-    def save_checkpoint(self, val_metric, model, optimizer, epoch, config, args):
+    def save_checkpoint(self, val_metric, model, model_name, optimizer, epoch, config, args):
         if self.verbose:
             print(f'Validation metric improved. Saving model...')
         
         current_time = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-        model_name = f'best_model_{current_time}_ep{epoch}_mae{val_metric:.4f}.pth'
+        model_name = f'{model_name}_{current_time}_ep{epoch}_mae{val_metric:.4f}.pth'
         save_path = os.path.join(self.save_dir, model_name)
         
         torch.save({
