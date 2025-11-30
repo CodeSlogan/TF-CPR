@@ -115,34 +115,37 @@ class StatisticsCalculator:
     @staticmethod
     def compute_abp_stats(subject_ids: List[str], config: DataConfig) -> Tuple[float, float]:
         """
-        仅遍历训练集受试者的 ABP 数据，计算全局 Median 和 IQR。
-        为了速度，可以设置采样率 (例如只读取每个人的第0行, 或者随机抽样)。
+        [全量版本] 遍历所有训练集数据计算精确的 Median 和 IQR。
         """
-        print("Computing Global ABP Statistics (Robust Median/IQR)...")
-        all_abp_values = []
+        print(f"Computing Global ABP Statistics on all {len(subject_ids)} subjects...")
         
         abp_dir = Path(config.data_root) / 'abp'
+        all_abp_values = []
         
-        # 为了避免内存爆炸，我们不加载所有数据
-        # 策略：从每个训练对象中随机抽取部分数据用于估算分布
-        # 如果数据集巨大，建议限制采样的 Subject 数量 (例如 max 1000 人)
-        sample_subjects = subject_ids[:1000] if len(subject_ids) > 1000 else subject_ids
-        
-        for pid in tqdm(sample_subjects, desc="Scanning ABP files"):
+        for pid in tqdm(subject_ids, desc="Loading all ABP data"):
             file_path = abp_dir / f"p{pid}_abp.npy"
             if file_path.exists():
-                data = np.load(file_path).astype(np.float32)
-                # 降采样：为了加速统计，每隔 10 个点取一个，足够估算分布
-                # 并且将其展平放入列表
-                all_abp_values.append(data.flatten()[::10]) 
-                
+                try:
+                    data = np.load(file_path, mmap_mode='r')
+                    
+                    if data.size == 0: continue
+                    flat_data = data.flatten().astype(np.float32)
+                    
+                    all_abp_values.append(flat_data)
+                        
+                except Exception as e:
+                    print(f"Warning: Error reading {pid}: {e}")
+                    continue
+
         if not all_abp_values:
             raise RuntimeError("No ABP data found to compute stats.")
             
         global_abp = np.concatenate(all_abp_values)
+        print(f"Total points collected: {len(global_abp):,}")
         
+        print("Calculating Median and IQR...")
         median = np.median(global_abp)
-        q75, q25 = np.percentile(global_abp, [75 ,25])
+        q75, q25 = np.percentile(global_abp, [75, 25])
         iqr = q75 - q25
         
         print(f"Global Stats Calculated: Median={median:.4f}, IQR={iqr:.4f}")
@@ -154,12 +157,10 @@ class DataFactory:
     def get_dataloaders(config: DataConfig):
         root = Path(config.data_root)
         
-        # 1. 获取 ID 列表
         all_files = glob.glob(str(root / 'ppg' / "*_ppg.npy"))
         if not all_files: raise RuntimeError("No data found")
         subject_ids = sorted(list(set([Path(f).stem.split('_')[0].replace('p', '') for f in all_files])))
         
-        # 2. 划分 ID
         train_ids, test_ids = train_test_split(subject_ids, test_size=(1 - config.train_ratio), random_state=config.seed)
         relative_val_ratio = config.val_ratio / (1 - config.train_ratio)
         val_ids, test_ids = train_test_split(test_ids, test_size=(1 - relative_val_ratio), random_state=config.seed)
@@ -168,24 +169,19 @@ class DataFactory:
         # 必须只用 train_ids 计算，防止数据穿越 (Data Leakage)
         median, iqr = StatisticsCalculator.compute_abp_stats(train_ids, config)
         
-        # 将计算结果更新到 Config 中，这样 Train/Val/Test 都会使用训练集的标准进行归一化
         config.abp_global_median = median
         config.abp_global_iqr = iqr
         
-        # 4. 构建 Dataset
         train_ds = MimicBPDataset(train_ids, config, mode='train')
         val_ds = MimicBPDataset(val_ids, config, mode='val')
         test_ds = MimicBPDataset(test_ids, config, mode='test')
         
-        # 5. Loader
         train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True, num_workers=config.num_workers, pin_memory=True)
         val_loader = DataLoader(val_ds, batch_size=config.batch_size, shuffle=False, num_workers=config.num_workers, pin_memory=True)
         test_loader = DataLoader(test_ds, batch_size=config.batch_size, shuffle=False, num_workers=config.num_workers)
         
         return train_loader, val_loader, test_loader
 
-# --- 还原 (Denormalize) 示例 ---
-# 模型输出后，必须还原成 mmHg 才能计算 MAE/RMSE
 def denormalize_abp(tensor: torch.Tensor, config: DataConfig) -> torch.Tensor:
         return tensor * config.abp_global_iqr + config.abp_global_median
 

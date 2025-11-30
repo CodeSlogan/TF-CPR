@@ -35,21 +35,15 @@ def get_args():
 
     # --- 2.2 Model Architecture ---
     parser.add_argument('--topK', type=int, default=12, help='Top-K for BP-Book retrieval')
-    parser.add_argument('--num_prototypes', type=int, default=1024, help='Number of prototypes for BP-Book')
+    parser.add_argument('--num_prototypes', type=int, default=64, help='Number of prototypes for BP-Book')
     parser.add_argument("--cwt_channels", type=int, default=32, help="cwt channels")
     parser.add_argument("--d_model", type=int, default=256, help="dimension of model")
-    parser.add_argument("--n_heads", type=int, default=8, help="num of heads")
-    parser.add_argument("--e_layers", type=int, default=12, help="num of encoder layers")
+    parser.add_argument("--n_heads", type=int, default=4, help="num of heads")
+    parser.add_argument("--e_layers", type=int, default=3, help="num of encoder layers")
     parser.add_argument("--d_ff", type=int, default=256, help="dimension of fcn")
     parser.add_argument("--factor", type=int, default=1, help="attn factor")
     parser.add_argument('--num_beats', type=int, default=16, help='Number of beats for TBR_ALMR_Module')
     parser.add_argument("--dropout", type=float, default=0.1, help="dropout")
-    parser.add_argument(
-        "--embed",
-        type=str,
-        default="timeF",
-        help="time features encoding, options:[timeF, fixed, learned]",
-    )
     parser.add_argument("--activation", type=str, default="gelu", help="activation")
     parser.add_argument(
         "--output_attention",
@@ -57,15 +51,9 @@ def get_args():
         help="whether to output attention in encoder",
     )
     parser.add_argument(
-        "--no_inter_attn",
-        action="store_true",
-        help="whether to use inter-attention in encoder, using this argument means not using inter-attention",
-        default=False,
-    )
-    parser.add_argument(
         "--patch_len_list",
         type=str,
-        default="8,8,8,16,16,16,32,32,32,64,64,64",
+        default="16,16,16,32,32,32,64,64,64",
         help="a list of patch len used in Medformer",
     )
     parser.add_argument(
@@ -83,19 +71,19 @@ def get_args():
     
     # --- 2.3 Loss Function Weights (Lambdas) ---
     parser.add_argument('--lambda_mse', type=float, default=1.0, help='Weight for MSE Loss')
-    parser.add_argument('--lambda_deriv', type=float, default=1.0, help='Weight for Derivative (Shape) Loss')
-    parser.add_argument('--lambda_freq', type=float, default=0.1, help='Weight for Frequency Domain Loss')
-    parser.add_argument('--lambda_almr', type=float, default=0.1, help='Weight for ALMR Self-Supervised Loss')
+    parser.add_argument('--lambda_deriv', type=float, default=0.8, help='Weight for Derivative (Shape) Loss')
+    parser.add_argument('--lambda_freq', type=float, default=0.3, help='Weight for Frequency Domain Loss')
+    parser.add_argument('--lambda_almr', type=float, default=0.3, help='Weight for ALMR Self-Supervised Loss')
 
     # --- 2.4 Training Hyperparams ---
-    parser.add_argument('--batch_size', type=int, default=64, help='Batch size')
+    parser.add_argument('--batch_size', type=int, default=384, help='Batch size')
     parser.add_argument('--epochs', type=int, default=50, help='Number of epochs')
     parser.add_argument('--lr', type=float, default=0.0001, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='Weight decay')
     parser.add_argument('--patience', type=int, default=10, help='Early stopping patience (epochs)') # New
     
     # --- 2.5 System ---
-    parser.add_argument('--seed', type=int, default=2026, help='Random seed')
+    parser.add_argument('--seed', type=int, default=72, help='Random seed')
     parser.add_argument('--device', type=str, default='cuda:0' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--save_path', type=str, default='./checkpoints/', help='Path to save models')
 
@@ -118,12 +106,12 @@ def validate(model, dataloader, args, config: DataConfig, lambdas: dict, prefix=
 
             abp_pred, ecg_rec, ppg_rec = model(torch.concat([ecg, ppg], dim=2))
 
-            # loss, loss_dict = complex_loss(
-            #     ecg, ppg, abp, 
-            #     ecg_rec, ppg_rec, abp_pred, 
-            #     lambdas=lambdas
-            # )
-            loss = nn.MSELoss()(abp_pred, abp.squeeze(2))  # Focus on ABP MSE for training
+            loss, loss_dict = complex_loss(
+                ecg, ppg, abp, 
+                ecg_rec, ppg_rec, abp_pred, 
+                lambdas=lambdas
+            )
+            # loss = nn.MSELoss()(abp_pred, abp.squeeze(2))  # Focus on ABP MSE for training
             total_loss += loss.item()
 
             pred_mmhg = denormalize_abp(abp_pred, config)
@@ -168,12 +156,12 @@ def train_mode(args, model, train_loader, val_loader, loss_lambdas, data_config)
             
             abp_pred, ecg_rec, ppg_rec = model(torch.concat([ecg, ppg], dim=2))
 
-            # loss, loss_dict = complex_loss(
-            #     ecg.squeeze(2), ppg.squeeze(2), abp.squeeze(2), 
-            #     ecg_rec, ppg_rec, abp_pred, 
-            #     lambdas=loss_lambdas
-            # )
-            loss = nn.MSELoss()(abp_pred, abp.squeeze(2))  # Focus on ABP MSE for training
+            loss, loss_dict = complex_loss(
+                ecg.squeeze(2), ppg.squeeze(2), abp.squeeze(2), 
+                ecg_rec, ppg_rec, abp_pred, 
+                lambdas=loss_lambdas
+            )
+            # loss = nn.MSELoss()(abp_pred, abp.squeeze(2))  # Focus on ABP MSE for training
             
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)

@@ -6,237 +6,197 @@ from .SelfAttention_Family import MedformerLayer, FullAttention, AttentionLayer
 from .Embed import ListPatchEmbedding
 
 
+# ---------------------------------------------------------
+# 1. 改进的特征调制层 (替代 AdaIN)
+# ---------------------------------------------------------
+class FiLM(nn.Module):
+    """
+    Feature-wise Linear Modulation: 不破坏原始特征的统计分布(Mean/Std)
+    而是基于 Style 进行仿射变换。保留了血压相关的幅度信息。
+    """
+    def __init__(self, in_channels, style_dim):
+        super().__init__()
+        self.scale_fc = nn.Linear(style_dim, in_channels)
+        self.shift_fc = nn.Linear(style_dim, in_channels)
+
+    def forward(self, x, style):
+        # x: (B, C, L)
+        # style: (B, S)
+        scale = self.scale_fc(style).unsqueeze(-1) # (B, C, 1)
+        shift = self.shift_fc(style).unsqueeze(-1)
+        return x * (1 + scale) + shift
+
+
+class ResBlockWithFiLM(nn.Module):
+    def __init__(self, in_channels, out_channels, style_dim):
+        super().__init__()
+        self.conv1 = nn.Conv1d(in_channels, out_channels, 3, padding=1)
+        self.conv2 = nn.Conv1d(out_channels, out_channels, 3, padding=1)
+        self.film = FiLM(out_channels, style_dim) # 替换 AdaIN
+        self.act = nn.GELU()
+        self.skip = nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
+
+    def forward(self, x, style):
+        resid = self.skip(x)
+        x = self.conv1(x)
+        x = self.act(x)
+        x = self.film(x, style) # 注入频域 Style
+        x = self.conv2(x)
+        return x + resid
+
+# ---------------------------------------------------------
+# 2. 真正的多尺度局部特征提取 (替代伪 CWT)
+# ---------------------------------------------------------
+class MultiScaleConv(nn.Module):
+    """
+    模拟 CWT/STFT 的多分辨率特性：使用不同 Kernel Size 并行提取
+    """
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        # 小卷积核捕获高频突变 (QRS)，大卷积核捕获低频趋势 (P/T wave)
+        self.branch1 = nn.Conv1d(in_channels, out_channels//2, kernel_size=3, padding=1)
+        self.branch2 = nn.Conv1d(in_channels, out_channels//2, kernel_size=11, padding=5)
+        self.fusion = nn.Conv1d(out_channels, out_channels, 1)
+
+    def forward(self, x):
+        # x: (B, 1, L)
+        # 增加 Channel 维度如果输入是 (B, L)
+        if x.dim() == 2: x = x.unsqueeze(1)
+        
+        b1 = F.gelu(self.branch1(x))
+        b2 = F.gelu(self.branch2(x))
+        out = torch.cat([b1, b2], dim=1)
+        return self.fusion(out)
+
 class FreqFeatureExtractor(nn.Module):
     def __init__(self, seq_len, d_model, cwt_channels=32):
         super().__init__()
-        self.seq_len = seq_len
         self.fft_mlp = nn.Sequential(
             nn.Linear((seq_len // 2 + 1) * 2, 128),
             nn.ReLU(),
             nn.Linear(128, d_model)
         )
-        # CWT 模拟
-        self.cwt_conv = nn.Sequential(
-            nn.Conv1d(1, cwt_channels, kernel_size=7, padding=3),
-            nn.InstanceNorm1d(cwt_channels),
-            nn.GELU(),
-            nn.Conv1d(cwt_channels, cwt_channels, kernel_size=3, padding=1)
-        )
-        self.cwt_proj = nn.Linear(cwt_channels, d_model) # Optional projection
-
+        # 替换为多尺度卷积
+        self.ms_conv = MultiScaleConv(1, cwt_channels)
+        
     def forward(self, x):
-        # x: (B, L)
+        # FFT 部分保持不变
         x_fft = torch.fft.rfft(x, dim=-1)
         x_fft_feat = torch.cat([x_fft.real, x_fft.imag], dim=-1)
         v_fft = self.fft_mlp(x_fft_feat) 
         
-        x_cwt = x.unsqueeze(1) 
-        m_cwt = self.cwt_conv(x_cwt) # (B, C_cwt, L)
-        return v_fft, m_cwt
+        # 多尺度卷积部分
+        m_local = self.ms_conv(x) # (B, C_cwt, L)
+        return v_fft, m_local
 
-
+# ---------------------------------------------------------
+# 3. 简化的 ALMR (修复重构逻辑)
+# ---------------------------------------------------------
 class ALMR_Module(nn.Module):
-    def __init__(self, d_model, seq_len, num_beats=16, patch_num=None): 
+    def __init__(self, d_model, seq_len, num_beats=16):
         super().__init__()
         self.d_model = d_model
-        self.seq_len = seq_len
+        
+        # 这里的 Beat Query 保持不变，用于提取全局节律
         self.q_beat = nn.Parameter(torch.randn(num_beats, d_model))
         
-        # Cross Attention: Q=Beat, K=Multi-Scale Context, V=Multi-Scale Context
-        self.cross_attn = AttentionLayer(
-            FullAttention(False, factor=1, attention_dropout=0.1, output_attention=True),
-            d_model, n_heads=1
-        )
+        # 简化 Attention，只用一层 Cross Attention 提取节律
+        self.cross_attn = nn.MultiheadAttention(d_model, num_heads=4, batch_first=True)
         
-        self.beat_decoder = nn.Sequential(nn.Linear(d_model, seq_len), nn.Tanh())
-        
-        # Injection Attention: Q=Multi-Scale Context, K=Beat, V=Beat
-        self.injection_attn = AttentionLayer(
-             FullAttention(False, factor=1, attention_dropout=0.1, output_attention=False),
-             d_model, n_heads=4
+        # 重构头：与其用 Attention 插值，不如训练一个小型 MLP/Conv 把 Beat 解码回信号
+        # 如果目的是辅助训练，越简单越好
+        self.recon_head = nn.Sequential(
+            nn.Linear(d_model, seq_len // num_beats * 2), # 粗略上采样
+            nn.GELU(),
+            nn.Linear(seq_len // num_beats * 2, seq_len // num_beats) # 假设均匀分布，这里只是辅助Loss
         )
-        self.rhythm_pool = nn.AdaptiveAvgPool1d(1)
+        self.final_recon_proj = nn.Linear(num_beats * (seq_len // num_beats), seq_len)
 
     def forward(self, x_embed_list, is_train=True):
-        """
-        x_embed_list: List of tensors [(B, N1, D), (B, N2, D), ...]
-        """
-        # 1. 记录每个尺度的长度，用于后续切分
-        lengths = [x.shape[1] for x in x_embed_list]
-        
-        # 2. 【多粒度聚合】 Concatenate 形成统一的 Context 空间
-        # (B, N_total, D) where N_total = sum(lengths)
-        x_concat = torch.cat(x_embed_list, dim=1) 
-        
-        B, N_total, D = x_concat.shape
-        
-        # 3. Beat Aggregation (在统一空间中检索)
-        q_beat_batch = self.q_beat.unsqueeze(0).expand(B, -1, -1) # (B, K, D)
-        
-        z_beat, attn_map = self.cross_attn(q_beat_batch, x_concat, x_concat, attn_mask=None)
-        attn_map = attn_map.squeeze(1) # (B, K, N_total)
+        # 1. Concat
+        x_concat = torch.cat(x_embed_list, dim=1) # (B, N, D)
+        B, N, D = x_concat.shape
+
+        # 2. Beat Extraction
+        q = self.q_beat.unsqueeze(0).expand(B, -1, -1) # (B, K, D)
+        z_beat, _ = self.cross_attn(q, x_concat, x_concat) # (B, K, D)
         
         x_recon = None
         if is_train:
-            s_hat = self.beat_decoder(z_beat) # (B, K, L)
-            
-            # ALMR 重构逻辑调整：
-            # attn_map 是对所有 patch 的权重。我们需要将其插值回原始信号长度 L。
-            # 直接 interpolate (B, K, N_total) -> (B, K, L) 是数学上合理的，
-            # 意味着模型学会了从混合尺度的权重映射到时间轴。
-            attn_up = F.interpolate(attn_map, size=self.seq_len, mode='linear', align_corners=False)
-            x_recon = torch.sum(s_hat * attn_up, dim=1) # (B, L)
-            
-        # 4. Feature Injection (广播回统一空间)
-        # 将提取出的纯净 Beat 信息注入回混合序列
-        x_injected, _ = self.injection_attn(x_concat, z_beat, z_beat, attn_mask=None)
+            # 简单的重构逻辑：Beat Embed -> Local Signal -> Stitch
+            # 这比 Attention 插值更稳定
+            local_sig = self.recon_head(z_beat) # (B, K, Sub_L)
+            flat_sig = local_sig.view(B, -1)
+            # 调整长度回 seq_len
+            x_recon = self.final_recon_proj(flat_sig) 
+
+        # 3. Injection (简单相加或门控，不要搞太复杂的 Attention 广播)
+        # 将 Beat 信息广播回每个 Patch，这里简化为 Global Average 的变体
+        beat_global = z_beat.mean(dim=1, keepdim=True) # (B, 1, D)
+        x_enhanced = x_concat + beat_global
         
-        # Rhythm Injection (Global)
-        rhythm = self.rhythm_pool(x_concat.transpose(1, 2)).transpose(1, 2) # (B, 1, D)
-        
-        # 融合
-        x_enhanced_concat = x_concat + x_injected + rhythm
-        
-        # 5. 【多粒度分发】 Split 回原本的 List 结构
-        # torch.split 返回一个 tuple，转回 list
-        x_final_list = list(torch.split(x_enhanced_concat, lengths, dim=1))
+        # Split back
+        lengths = [x.shape[1] for x in x_embed_list]
+        x_final_list = list(torch.split(x_enhanced, lengths, dim=1))
         
         return x_final_list, x_recon
 
-
-class AdaIN(nn.Module):
-    """
-    参考方案中的 AdaIN 实现：高效、简洁
-    """
-    def __init__(self, c, s):
-        super().__init__()
-        self.fc = nn.Linear(s, c * 2)
-        
-    def forward(self, x, style):
-        # x: [B, C, L], style: [B, S]
-        # chunk(2, 1) 在 dim=1 (channel) 上切分为 gamma 和 beta
-        g, b = self.fc(style).unsqueeze(-1).chunk(2, 1)
-        # 标准化 + 仿射变换
-        mean = x.mean(2, keepdim=True)
-        std = x.std(2, keepdim=True) + 1e-8
-        return ((x - mean) / std) * g + b
-
-class AdaINResBlock(nn.Module):
-    """
-    将 AdaIN 有机结合到残差块中，保证深层网络的梯度传播
-    """
-    def __init__(self, in_channels, out_channels, style_dim):
-        super().__init__()
-        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=3, padding=1)
-        
-        # 嵌入参考代码风格的 AdaIN
-        self.adain = AdaIN(out_channels, style_dim)
-        
-        self.act = nn.GELU()
-        
-        # Skip connection
-        self.skip = nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
-
-    def forward(self, x, style):
-        resid = self.skip(x)
-        
-        x = self.conv1(x)
-        x = self.act(x)
-        
-        # 使用 AdaIN 进行风格注入
-        x = self.adain(x, style)
-        
-        x = self.conv2(x)
-        return x + resid
-    
-
+# ---------------------------------------------------------
+# 4. 优化的 Decoder (U-Net 结构)
+# ---------------------------------------------------------
 class Decoder(nn.Module):
     def __init__(self, d_model, target_len, fft_dim, cwt_dim):
         super().__init__()
         self.target_len = target_len
-        
-        # 1. CWT 投影层 (参考代码思路)
-        # 将双流 CWT (ECG+PPG) 投影到较小的维度，避免 concat 后通道过大
-        # 输入维度: cwt_dim (单流通道) * 2
-        self.cwt_proj = nn.Conv1d(cwt_dim * 2, d_model // 2, kernel_size=1)
-        
-        # 2. 初始处理
-        # 假设输入是 Transformer 的 sequence output (B, N, D)
-        # 我们先把它转为 (B, D, N) 并做一次卷积整理
+        self.cwt_proj = nn.Conv1d(cwt_dim * 2, d_model // 2, 1) # ECG+PPG
         self.start_conv = nn.Conv1d(d_model, d_model, 1)
 
-        # 3. 渐进式解码 Block (U-Net Style)
-        # Stage 1: Upsample x2
-        self.up1 = nn.Upsample(scale_factor=2, mode='linear', align_corners=False)
-        # Fusion 1: 输入 = 上一层(D) + CWT投影(D/2)
-        self.fusion1 = nn.Conv1d(d_model + d_model // 2, d_model, 1)
-        self.res1 = AdaINResBlock(d_model, d_model // 2, fft_dim) # 输出通道减半
-
-        # Stage 2: Upsample x2
-        self.up2 = nn.Upsample(scale_factor=2, mode='linear', align_corners=False)
-        # Fusion 2: 输入 = 上一层(D/2) + CWT投影(D/2)
-        self.fusion2 = nn.Conv1d(d_model // 2 + d_model // 2, d_model // 2, 1)
-        self.res2 = AdaINResBlock(d_model // 2, d_model // 4, fft_dim)
-
-        # Stage 3: Upsample x2
-        self.up3 = nn.Upsample(scale_factor=2, mode='linear', align_corners=False)
-        # Fusion 3
-        self.fusion3 = nn.Conv1d(d_model // 4 + d_model // 2, d_model // 4, 1)
-        self.res3 = AdaINResBlock(d_model // 4, 32, fft_dim)
-
-        # 4. 输出层
-        self.out_conv = nn.Conv1d(32, 1, kernel_size=1)
+        # 3层 U-Net，通道数递减
+        self.up1 = nn.Upsample(scale_factor=2, mode='linear')
+        self.block1 = ResBlockWithFiLM(d_model + d_model//2, d_model, fft_dim)
+        
+        self.up2 = nn.Upsample(scale_factor=2, mode='linear')
+        self.block2 = ResBlockWithFiLM(d_model + d_model//2, d_model//2, fft_dim)
+        
+        self.up3 = nn.Upsample(scale_factor=2, mode='linear')
+        self.block3 = ResBlockWithFiLM(d_model//2 + d_model//2, d_model//4, fft_dim)
+        
+        self.out = nn.Conv1d(d_model//4, 1, 1)
 
     def forward(self, x, fft_style, cwt_ecg, cwt_ppg):
-        """
-        x: (B, N, D) - Transformer Latent
-        fft_style: (B, FFT_Dim) - Global Style
-        cwt_ecg, cwt_ppg: (B, C_cwt, L_orig) - Local Details
-        """
-        # 1. 准备 Latent
-        x = x.transpose(1, 2) # (B, N, D) -> (B, D, N)
-        x = self.start_conv(x)
-        
-        # 2. 准备 CWT (Feature Pyramid 思想)
-        # 先拼接双流，再投影
-        cwt_raw = torch.cat([cwt_ecg, cwt_ppg], dim=1) # (B, 2*C_cwt, L_orig)
-        
-        # 辅助函数：将 CWT 调整到当前 x 的尺寸并融合
-        # 这里结合了参考代码的 "project" 和 "interpolate" 思路
-        def fuse_cwt(curr_x, raw_cwt):
-            B, C, N_curr = curr_x.shape
-            # a. 将高分辨 CWT 下采样/插值到当前层级的分辨率 N_curr
-            cwt_resized = F.interpolate(raw_cwt, size=N_curr, mode='linear', align_corners=False)
-            # b. 投影减少通道 (Sharing projection weights or independent? 
-            # 这里为了简单复用同一个 cwt_proj，注意 cwt_proj 是 1x1 conv，对分辨率不敏感)
-            cwt_feat = self.cwt_proj(cwt_resized)
-            # c. Concat
-            return torch.cat([curr_x, cwt_feat], dim=1)
+        # x: (B, N, D)
+        x = x.transpose(1, 2)
+        x = self.start_conv(x) # (B, D, N)
 
-        # --- Block 1 ---
-        x = self.up1(x)       # N -> 2N
-        x = fuse_cwt(x, cwt_raw)
-        x = self.fusion1(x)   # Reduce channels after concat
-        x = self.res1(x, fft_style)
-
-        # --- Block 2 ---
-        x = self.up2(x)       # 2N -> 4N
-        x = fuse_cwt(x, cwt_raw)
-        x = self.fusion2(x)
-        x = self.res2(x, fft_style)
-
-        # --- Block 3 ---
-        x = self.up3(x)       # 4N -> 8N (此时接近 target_len，如 624)
-        x = fuse_cwt(x, cwt_raw)
-        x = self.fusion3(x)
-        x = self.res3(x, fft_style)
-
-        x_final = F.interpolate(x, size=self.target_len, mode='linear', align_corners=False)
+        # 处理 CWT: (B, 2C, L)
+        raw_cwt = torch.cat([cwt_ecg, cwt_ppg], dim=1)
         
-        out = self.out_conv(x_final).squeeze(1) # (B, L)
+        def get_skip(target_len):
+            # 将 CWT 缩放到当前层级并投影
+            c = F.interpolate(raw_cwt, size=target_len, mode='linear', align_corners=False)
+            return self.cwt_proj(c)
+
+        # Stage 1
+        x = self.up1(x)
+        skip = get_skip(x.shape[-1])
+        x = torch.cat([x, skip], dim=1)
+        x = self.block1(x, fft_style)
+
+        # Stage 2
+        x = self.up2(x)
+        skip = get_skip(x.shape[-1])
+        x = torch.cat([x, skip], dim=1)
+        x = self.block2(x, fft_style)
         
-        return out
+        # Stage 3
+        x = self.up3(x)
+        skip = get_skip(x.shape[-1])
+        x = torch.cat([x, skip], dim=1)
+        x = self.block3(x, fft_style)
+        
+        # Final
+        x = F.interpolate(x, size=self.target_len, mode='linear')
+        return self.out(x).squeeze(1)
 
 
 class Medformer(nn.Module):
@@ -253,8 +213,8 @@ class Medformer(nn.Module):
         
         # ALMR
         total_patches = sum([int((configs.seq_len - pl) / pl + 2) for pl in patch_len_list])
-        self.tbr_ecg = ALMR_Module(configs.d_model, configs.seq_len, configs.num_beats, patch_num=total_patches)
-        self.tbr_ppg = ALMR_Module(configs.d_model, configs.seq_len, configs.num_beats, patch_num=total_patches)
+        self.tbr_ecg = ALMR_Module(configs.d_model, configs.seq_len, configs.num_beats)
+        self.tbr_ppg = ALMR_Module(configs.d_model, configs.seq_len, configs.num_beats)
         
         self.ecg_encoder = Encoder(
             [EncoderLayer(
