@@ -156,6 +156,8 @@ cython_debug/
 
 dataset/
 checkpoints/
+vis_results/
+vis_results*/
 
 # PyCharm
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
