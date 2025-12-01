@@ -4,11 +4,9 @@ import torch.nn.functional as F
 from .TFCPR_EncDec import EncoderLayer, Encoder
 from .SelfAttention_Family import TFCPRLayer, FullAttention, AttentionLayer
 from .Embed import ListPatchEmbedding
+import math
 
 
-# ---------------------------------------------------------
-# 1. 改进的特征调制层 (替代 AdaIN)
-# ---------------------------------------------------------
 class FiLM(nn.Module):
     """
     Feature-wise Linear Modulation: 不破坏原始特征的统计分布(Mean/Std)
@@ -44,9 +42,7 @@ class ResBlockWithFiLM(nn.Module):
         x = self.conv2(x)
         return x + resid
 
-# ---------------------------------------------------------
-# 2. 真正的多尺度局部特征提取 (替代伪 CWT)
-# ---------------------------------------------------------
+
 class MultiScaleConv(nn.Module):
     """
     模拟 CWT/STFT 的多分辨率特性：使用不同 Kernel Size 并行提取
@@ -68,69 +64,145 @@ class MultiScaleConv(nn.Module):
         out = torch.cat([b1, b2], dim=1)
         return self.fusion(out)
 
+
 class FreqFeatureExtractor(nn.Module):
-    def __init__(self, seq_len, d_model, cwt_channels=32):
+    def __init__(self, seq_len, d_model=128, cwt_channels=32, num_freq_patches=16):
         super().__init__()
-        self.fft_mlp = nn.Sequential(
-            nn.Linear((seq_len // 2 + 1) * 2, 128),
-            nn.ReLU(),
-            nn.Linear(128, d_model)
+        
+        fft_len = seq_len // 2 + 1
+        self.input_dim = fft_len * 2
+        
+        self.patch_conv = nn.Sequential(
+            nn.Conv1d(1, 128, kernel_size=16, stride=8), # 模拟 Patching，提取局部频谱特征
+            nn.BatchNorm1d(128),
+            nn.GELU()
         )
-        # 替换为多尺度卷积
+        
+        self.attention_mlp = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),     
+            nn.Flatten(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 128),          
+            nn.Sigmoid()                 
+        )
+        
+        # 4. 最终映射
+        self.out_proj = nn.Linear(128, d_model)
+
+        # CWT 部分 (保持不变)
         self.ms_conv = MultiScaleConv(1, cwt_channels)
+
+    def forward(self, x, x_raw):
+        """
+        x: [B, 1, L] (归一化后的数据，给 CWT 用)
+        x_raw: [B, 1, L] (原始数据，给 FFT 用，保留幅值能量)
+        """
+        B = x.shape[0]
         
-    def forward(self, x):
-        # FFT 部分保持不变
-        x_fft = torch.fft.rfft(x, dim=-1)
-        x_fft_feat = torch.cat([x_fft.real, x_fft.imag], dim=-1)
-        v_fft = self.fft_mlp(x_fft_feat) 
+        # --- Part A: FFT Path (Frequency Attention) ---
         
-        # 多尺度卷积部分
-        m_local = self.ms_conv(x) # (B, C_cwt, L)
+        # 1. 计算 FFT
+        # x_raw: [B, 1, L] -> rfft -> [B, 1, L//2+1]
+        x_fft = torch.fft.rfft(x_raw.squeeze(1), dim=-1)
+        x_fft_mag = x_fft.abs() # [B, 1, L//2+1]
+        x_fft_mag = x_fft_mag.unsqueeze(1)
+        
+        # 3. 频域 Patching (Conv1d)
+        fft_feats = self.patch_conv(x_fft_mag) 
+        
+        # 4. 计算注意力权重
+        # [B, 128, Reduced_Len] -> Global Pool -> [B, 128] -> MLP -> [B, 128]
+        attn_weights = self.attention_mlp(fft_feats)
+        
+        # 5. 加权融合 (Attention-Weighted Aggregation)
+        # feat: [B, 128, Len], weight: [B, 128, 1]
+        # 这是一个 Channel Attention 操作
+        fft_weighted = fft_feats * attn_weights.unsqueeze(-1)
+        
+        # 6. Global Pooling & Projection
+        # 聚合所有频段的信息得到最终的 Style Vector
+        v_fft = fft_weighted.mean(dim=-1) # [B, 128]
+        v_fft = self.out_proj(v_fft)      # [B, d_model]
+        
+        # --- Part B: CWT Path (保持不变) ---
+        m_local = self.ms_conv(x) 
+        
         return v_fft, m_local
 
-# ---------------------------------------------------------
-# 3. 简化的 ALMR (修复重构逻辑)
-# ---------------------------------------------------------
+
 class ALMR_Module(nn.Module):
-    def __init__(self, d_model, seq_len, num_beats=16):
+    def __init__(self, d_model, raw_seq_len=1250, num_beats=16):
         super().__init__()
         self.d_model = d_model
+        self.num_beats = num_beats
+        self.raw_seq_len = raw_seq_len
         
-        self.q_beat = nn.Parameter(torch.randn(num_beats, d_model))
-        self.cross_attn = nn.MultiheadAttention(d_model, num_heads=4, batch_first=True)
+        # 1. Latent Beat Queries (心脏: 学习心跳原型)
+        self.q_beat = nn.Parameter(torch.randn(1, num_beats, d_model))
         
-        self.recon_head = nn.Sequential(
-            nn.Linear(d_model, seq_len // num_beats * 2), 
-            nn.GELU(),
-            nn.Linear(seq_len // num_beats * 2, seq_len // num_beats) 
-        )
-        self.final_recon_proj = nn.Linear(num_beats * (seq_len // num_beats), seq_len)
+        # 2. Token -> Beat (聚合: 从混乱的多尺度 Token 中提取有序的 Beat)
+        self.attn_token2beat = nn.MultiheadAttention(d_model, num_heads=4, batch_first=True)
+        
+        # 3. Beat -> Token (注入: 增强 Token)
+        self.attn_beat2token = nn.MultiheadAttention(d_model, num_heads=4, batch_first=True)
+        
+        # --- [关键修改] 基于坐标的重建解码器 ---
+        
+        # 定义一组固定的“时间锚点”，代表原始信号的每一个采样点
+        # Shape: [1, Raw_Len, D]
+        # 使用 Sinusoidal 位置编码初始化，代表绝对时间位置
+        self.time_queries = nn.Parameter(self._init_positional_encoding(raw_seq_len, d_model), requires_grad=False)
+        
+        # Beat -> Signal 的解码注意力
+        # Q = Time Queries (我想知道第 t 秒的值)
+        # K, V = Beat Embeddings (我知道心跳的形态)
+        self.recon_attn = nn.MultiheadAttention(d_model, num_heads=4, batch_first=True)
+        
+        # 最终映射到数值
+        self.out_proj = nn.Linear(d_model, 1)
 
-    def forward(self, x_embed_list, is_train=True):
-        # 1. Concat
-        x_concat = torch.cat(x_embed_list, dim=1) # (B, N, D)
-        B, N, D = x_concat.shape
+    def _init_positional_encoding(self, length, d_model):
+        """生成标准的时间位置编码作为查询锚点"""
+        pe = torch.zeros(length, d_model)
+        position = torch.arange(0, length, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        return pe.unsqueeze(0) # [1, L, D]
 
-        # 2. Beat Extraction
-        q = self.q_beat.unsqueeze(0).expand(B, -1, -1) # (B, K, D)
-        z_beat, _ = self.cross_attn(q, x_concat, x_concat) # (B, K, D)
+    def forward(self, x_token, is_train=True):
+        """
+        x_token: [B, N_mixed, D] (由多粒度拼接而成的 Token，N 大小不定)
+        x_raw:   [B, L] (原始信号)
+        """
+        B, N, D = x_token.shape
         
-        x_recon = None
-        if is_train:
-            local_sig = self.recon_head(z_beat) # (B, K, Sub_L)
-            flat_sig = local_sig.view(B, -1)
-            # 调整长度回 seq_len
-            x_recon = self.final_recon_proj(flat_sig) 
-
-        beat_global = z_beat.mean(dim=1, keepdim=True) # (B, 1, D)
-        x_enhanced = x_concat + beat_global
+        # --- 1. Beat Extraction (从多尺度特征中提取 Beat) ---
+        q = self.q_beat.repeat(B, 1, 1) # [B, K, D]
+        z_beat, _ = self.attn_token2beat(q, x_token, x_token)
         
-        # Split back
-        lengths = [x.shape[1] for x in x_embed_list]
-        x_final_list = list(torch.split(x_enhanced, lengths, dim=1))
+        # --- 2. Feature Injection (回注增强) ---
+        # 所有的 Token (无论大粒度还是小粒度) 都从中受益
+        context, _ = self.attn_beat2token(x_token, z_beat, z_beat)
+        x_enhanced = x_token + context
         
-        return x_final_list, x_recon
+        # --- 3. Coordinate-Based Reconstruction (坐标解码) ---
+        
+        if is_train :
+            # 这里的逻辑是：用"时间坐标"去查询"Beat特征"
+            # 只有当 Beat 特征真正包含了完整的波形形态时，它才能正确回答每个时间点的数值
+            # Q: [B, Raw_Len, D] (时间坐标)
+            time_q = self.time_queries.repeat(B, 1, 1).to(x_token.device)
+            
+            # K, V: [B, K, D] (Beat 特征)
+            # 输出: [B, Raw_Len, D]
+            recon_feat, _ = self.recon_attn(time_q, z_beat, z_beat)
+            
+            # 映射回波形数值: [B, Raw_Len, 1] -> [B, Raw_Len]
+            x_recon = self.out_proj(recon_feat).squeeze(-1)
+            
+        return x_enhanced, x_recon
 
 
 class Decoder(nn.Module):
@@ -140,7 +212,6 @@ class Decoder(nn.Module):
         self.cwt_proj = nn.Conv1d(cwt_dim * 2, d_model // 2, 1) # ECG+PPG
         self.start_conv = nn.Conv1d(d_model, d_model, 1)
 
-        # 3层 U-Net，通道数递减
         self.up1 = nn.Upsample(scale_factor=2, mode='linear')
         self.block1 = ResBlockWithFiLM(d_model + d_model//2, d_model, fft_dim)
         
@@ -157,35 +228,81 @@ class Decoder(nn.Module):
         x = x.transpose(1, 2)
         x = self.start_conv(x) # (B, D, N)
 
-        # 处理 CWT: (B, 2C, L)
+        # (B, 2C, L)
         raw_cwt = torch.cat([cwt_ecg, cwt_ppg], dim=1)
         
         def get_skip(target_len):
-            # 将 CWT 缩放到当前层级并投影
             c = F.interpolate(raw_cwt, size=target_len, mode='linear', align_corners=False)
             return self.cwt_proj(c)
 
-        # Stage 1
         x = self.up1(x)
         skip = get_skip(x.shape[-1])
         x = torch.cat([x, skip], dim=1)
         x = self.block1(x, fft_style)
 
-        # Stage 2
         x = self.up2(x)
         skip = get_skip(x.shape[-1])
         x = torch.cat([x, skip], dim=1)
         x = self.block2(x, fft_style)
         
-        # Stage 3
         x = self.up3(x)
         skip = get_skip(x.shape[-1])
         x = torch.cat([x, skip], dim=1)
         x = self.block3(x, fft_style)
         
-        # Final
         x = F.interpolate(x, size=self.target_len, mode='linear')
         return self.out(x).squeeze(1)
+
+
+class JointBPBook(nn.Module):
+    """
+    [最佳实践] 联合生理状态字典
+    存储 (ECG特征 + PPG特征 + PTT关系) 的联合高维原型
+    """
+    def __init__(self, num_slots=2048, d_model=128, topk=5):
+        super().__init__()
+        self.d_model = d_model
+        self.topk = topk
+        
+        self.memory = nn.Parameter(torch.randn(num_slots, d_model))
+        self.retrieval_scale = nn.Parameter(torch.tensor(0.1))
+        
+        self.query_proj = nn.Linear(d_model, d_model)
+
+    def forward(self, x_fused):
+        """
+        x_fused: [B, N, D] or [B, D] (如果是全局检索)
+        """
+        if x_fused.dim() == 3:
+            query = x_fused.mean(dim=1) 
+        else:
+            query = x_fused
+            
+        query = self.query_proj(query)
+        
+        # 1. 归一化 & 相似度
+        q_norm = F.normalize(query, dim=-1)
+        m_norm = F.normalize(self.memory, dim=-1)
+        sim = torch.matmul(q_norm, m_norm.t()) # [B, Slots]
+        
+        # 2. Top-K 检索
+        scores, indices = torch.topk(sim, self.topk, dim=-1)
+        weights = F.softmax(scores, dim=-1)
+        
+        # 3. 聚合原型
+        # indices: [B, K] -> [B*K]
+        flat_indices = indices.view(-1)
+        retrieved = F.embedding(flat_indices, self.memory).view(*indices.shape, -1) # [B, K, D]
+        
+        # [B, K, 1] * [B, K, D] -> sum -> [B, D]
+        prototype = (retrieved * weights.unsqueeze(-1)).sum(dim=1)
+        
+        # 4. 广播并注入回序列
+        # [B, N, D] + [B, 1, D]
+        if x_fused.dim() == 3:
+            return x_fused + self.retrieval_scale * prototype.unsqueeze(1)
+        else:
+            return x_fused + self.retrieval_scale * prototype
 
 
 class TFCPR(nn.Module):
@@ -208,15 +325,13 @@ class TFCPR(nn.Module):
         self.ecg_encoder = Encoder(
             [EncoderLayer(
                 TFCPRLayer(len(patch_len_list), configs.d_model, configs.n_heads, configs.dropout),
-                configs.d_model, configs.d_ff, dropout=configs.dropout, use_bp_book=False, num_prototypes=configs.num_prototypes, bp_book_topk=configs.topK
-            ) for _ in range(configs.e_layers)],
+                configs.d_model, configs.d_ff, dropout=configs.dropout) for _ in range(configs.e_layers)],
             norm_layer=nn.LayerNorm(configs.d_model)
         )
         self.ppg_encoder = Encoder(
             [EncoderLayer(
                 TFCPRLayer(len(patch_len_list), configs.d_model, configs.n_heads, configs.dropout),
-                configs.d_model, configs.d_ff, dropout=configs.dropout, use_bp_book=False, num_prototypes=configs.num_prototypes, bp_book_topk=configs.topK
-            ) for _ in range(configs.e_layers)],
+                configs.d_model, configs.d_ff, dropout=configs.dropout) for _ in range(configs.e_layers)],
             norm_layer=nn.LayerNorm(configs.d_model)
         )
         
@@ -228,39 +343,32 @@ class TFCPR(nn.Module):
             nn.LayerNorm(configs.d_model),
             nn.GELU()
         )
+        self.joint_bp_book = JointBPBook(num_slots=configs.num_slots, d_model=configs.d_model, topk=configs.topk)
         
         # Decoder 
         self.decoder = Decoder(configs.d_model, configs.seq_len, configs.d_model*2, cwt_dim=configs.cwt_channels)
 
-        self.scalar_head = nn.Sequential(
-            nn.AdaptiveAvgPool1d(1),      # (B, N, D) -> (B, D, 1) 全局池化
-            nn.Flatten(),                 # (B, D)
-            nn.Linear(configs.d_model, 128),
-            nn.LayerNorm(128),            # 加个 Norm 稳一点
-            nn.GELU(),
-            nn.Dropout(configs.dropout),
-            nn.Linear(128, 2)             # [Mean, Std]
-        )
-
     def forward(self, x_enc):
         x_ecg = x_enc[:, :, 0] 
         x_ppg = x_enc[:, :, 1]
+        x_ecg_raw = x_enc[:, :, 2]
+        x_ppg_raw = x_enc[:, :, 3]
         
         # 1. Freq Features (FFT for Style, CWT for Details)
-        v_fft_ecg, m_cwt_ecg = self.freq_extractor(x_ecg)
-        v_fft_ppg, m_cwt_ppg = self.freq_extractor(x_ppg)
+        v_fft_ecg, m_cwt_ecg = self.freq_extractor(x_ecg, x_ecg_raw)
+        v_fft_ppg, m_cwt_ppg = self.freq_extractor(x_ppg, x_ppg_raw)
         v_style = torch.cat([v_fft_ecg, v_fft_ppg], dim=-1) # (B, 2D)
         
         # 2. Embedding
         h_ecg = self.ecg_embedding(x_ecg.unsqueeze(-1))
         h_ppg = self.ppg_embedding(x_ppg.unsqueeze(-1))
-        
-        h_ecg, recon_ecg = self.tbr_ecg(h_ecg, self.is_train)
-        h_ppg, recon_ppg = self.tbr_ppg(h_ppg, self.is_train)
-        
-        # 3. Encoder (BP-Book inside)
+
+        # 3. Encoder
         h_ecg_enc, _ = self.ecg_encoder(h_ecg)
         h_ppg_enc, _ = self.ppg_encoder(h_ppg)
+
+        h_ecg_enc, recon_ecg = self.tbr_ecg(h_ecg_enc, self.is_train)
+        h_ppg_enc, recon_ppg = self.tbr_ppg(h_ppg_enc, self.is_train)
         
         # 4. Cross Fusion
         h_ecg_to_ppg, _ = self.cross_ecg_to_ppg(h_ecg_enc, h_ppg_enc, h_ppg_enc, attn_mask=None)
@@ -268,27 +376,12 @@ class TFCPR(nn.Module):
         
         h_fused = torch.cat([h_ecg_enc, h_ppg_enc, h_ecg_to_ppg, h_ppg_to_ecg], dim=-1)
         h_fused = self.fusion_mlp(h_fused) # (B, N, D)
+        fused_calibrated = self.joint_bp_book(h_fused)
         
-        # 5. Decoder (with CWT injection)
-        pred_shape = self.decoder(h_fused, v_style, m_cwt_ecg, m_cwt_ppg) 
+        # 5. Decoder 
+        abp_pred = self.decoder(fused_calibrated, v_style, m_cwt_ecg, m_cwt_ppg) 
         
-        # ---------------------------------------------------
-        # Stage 2: 数值预测 (Scalar Prediction)
-        # ---------------------------------------------------
-        pred_stats = self.scalar_head(h_fused.transpose(1, 2)) # (B, 2)
-        
-        pred_mean = pred_stats[:, 0].unsqueeze(1) # (B, 1)
-        pred_std  = pred_stats[:, 1].unsqueeze(1) # (B, 1)
-        pred_std = F.softplus(pred_std)
-        # ---------------------------------------------------
-        # Reconstruction: 物理重构
-        # ---------------------------------------------------
-        # 最终 ABP = Shape * Std + Mean
-        # 这一步是可导的，梯度会分别传给 Decoder 和 ScalarHead
-        pred_abp_final = pred_shape * pred_std + pred_mean
-
         if self.is_train:
-            # 返回: 最终ABP, 归一化形状, 预测的统计量
-            return pred_abp_final, pred_shape, pred_stats, recon_ecg, recon_ppg
+            return abp_pred, recon_ecg, recon_ppg
         else:
-            return pred_abp_final
+            return abp_pred

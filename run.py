@@ -14,6 +14,7 @@ from utils.data_factory import DataFactory, DataConfig, denormalize_abp
 from utils.loss import complex_loss
 from utils.earlystop import EarlyStopping
 from utils.compute_sbp_dbp import calculate_sbp_dbp_from_abp_waveform
+from utils.ldsweight import LDSWeightCalculator
 from model.tfcpr.TFCPR import TFCPR
 
 
@@ -28,16 +29,16 @@ def get_args():
     # --- 2.1 Dataset Parameters ---
     parser.add_argument('--data_root', type=str, default='./dataset/mimicbp', help='Data root directory')
     parser.add_argument('--original_length', type=int, default=3750, help='Raw NPY file row length')
-    parser.add_argument('--seq_len', type=int, default=1250, help='Input window size (slicing length)')
-    parser.add_argument("--pred_len", type=int, default=1250, help="prediction sequence length")
-    parser.add_argument('--stride', type=int, default=1250, help='Sliding window stride')
+    parser.add_argument('--seq_len', type=int, default=625, help='Input window size (slicing length)')
+    parser.add_argument("--pred_len", type=int, default=625, help="prediction sequence length")
+    parser.add_argument('--stride', type=int, default=625, help='Sliding window stride')
     parser.add_argument('--train_ratio', type=float, default=0.7, help='Train set ratio')
     parser.add_argument('--val_ratio', type=float, default=0.1, help='Validation set ratio')
     parser.add_argument('--num_workers', type=int, default=4, help='DataLoader workers')
 
     # --- 2.2 Model Architecture ---
-    parser.add_argument('--topK', type=int, default=12, help='Top-K for BP-Book retrieval')
-    parser.add_argument('--num_prototypes', type=int, default=64, help='Number of prototypes for BP-Book')
+    parser.add_argument('--topk', type=int, default=12, help='Top-K for BP-Book retrieval')
+    parser.add_argument('--num_slots', type=int, default=1024, help='Number of prototypes for BP-Book')
     parser.add_argument("--cwt_channels", type=int, default=32, help="cwt channels")
     parser.add_argument("--d_model", type=int, default=256, help="dimension of model")
     parser.add_argument("--n_heads", type=int, default=4, help="num of heads")
@@ -55,7 +56,7 @@ def get_args():
     parser.add_argument(
         "--patch_len_list",
         type=str,
-        default="8,8,8,16,16,16,32,32,32,64,64,64,125,125,125",
+        default="8,8,8,16,16,16,32,32,32,64,64,64",
         help="a list of patch len used in TFCPR",
     )
     parser.add_argument(
@@ -73,13 +74,11 @@ def get_args():
     
     # --- 2.3 Loss Function Weights (Lambdas) ---
     parser.add_argument('--lambda_mse', type=float, default=1.0, help='Weight for MSE Loss')
-    parser.add_argument('--lambda_deriv', type=float, default=1.0, help='Weight for Derivative (Shape) Loss')
     parser.add_argument('--lambda_almr', type=float, default=0.2, help='Weight for ALMR Self-Supervised Loss')
-    parser.add_argument('--lambda_pcc', type=float, default=1.0, help='Weight for Pearson Correlation Coefficient Loss')
-    parser.add_argument('--lambda_scalar', type=float, default=10.0, help='Weight for Scalar Loss')
+    parser.add_argument('--lambda_pcc', type=float, default=0.8, help='Weight for Pearson Correlation Coefficient Loss')
 
     # --- 2.4 Training Hyperparams ---
-    parser.add_argument('--batch_size', type=int, default=64, help='Batch size')
+    parser.add_argument('--batch_size', type=int, default=128, help='Batch size')
     parser.add_argument('--epochs', type=int, default=100, help='Number of epochs')
     parser.add_argument('--lr', type=float, default=0.0003, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='Weight decay')
@@ -87,7 +86,7 @@ def get_args():
     
     # --- 2.5 System ---
     parser.add_argument('--seed', type=int, default=27, help='Random seed')
-    parser.add_argument('--device', type=str, default='cuda:0' if torch.cuda.is_available() else 'cpu')
+    parser.add_argument('--device', type=str, default='cuda:1' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--save_path', type=str, default='./checkpoints/', help='Path to save models')
 
     return parser.parse_args()
@@ -98,28 +97,31 @@ def validate(model, dataloader, args, config: DataConfig, prefix="Validating"):
     total_loss = 0
     steps = 0
     
-    all_errors = []  # 整体ABP波形误差
-    sbp_errors = []  # SBP单独误差
-    dbp_errors = []  # DBP单独误差
+    all_errors = []  
+    sbp_errors = [] 
+    dbp_errors = []  
     
     with torch.no_grad():
         for batch in tqdm(dataloader, desc=prefix, leave=False):
             ppg = batch['ppg'].to(args.device).permute(0, 2, 1)
             ecg = batch['ecg'].to(args.device).permute(0, 2, 1)
             abp = batch['abp'].to(args.device).permute(0, 2, 1)
+            ppg_raw = batch['ppg_raw'].to(args.device).permute(0, 2, 1)
+            ecg_raw = batch['ecg_raw'].to(args.device).permute(0, 2, 1)
+            abp_raw = batch['abp_raw'].to(args.device).permute(0, 2, 1)
 
             # 模型推理
-            pred_abp_final, pred_shape, pred_stats, recon_ecg, recon_ppg = model(torch.concat([ecg, ppg], dim=2))
+            abp_pred, recon_ecg, recon_ppg = model(torch.concat([ecg, ppg, ecg_raw, ppg_raw], dim=2))
 
             # 计算损失
             loss = complex_loss(
                 ecg.squeeze(2), ppg.squeeze(2), abp.squeeze(2), 
-                recon_ecg, recon_ppg, pred_abp_final, pred_shape, pred_stats,
+                recon_ecg, recon_ppg, abp_pred,
                 args
             )
             total_loss += loss.item()
 
-            pred_mmhg = denormalize_abp(pred_abp_final, config)  # shape: [batch_size, 1250]
+            pred_mmhg = denormalize_abp(abp_pred, config)  # shape: [batch_size, 1250]
             target_mmhg = denormalize_abp(abp.squeeze(), config)  # shape: [batch_size, 1250]
             
             batch_error = pred_mmhg - target_mmhg
@@ -194,6 +196,13 @@ def train_mode(args, model, train_loader, val_loader, data_config):
 
     early_stopping = EarlyStopping(patience=args.patience, verbose=True, save_dir=args.save_path)
 
+    print("Computing LDS weights...")
+    lds_calculator = LDSWeightCalculator(
+        all_train_labels=data_config.all_sbp_labels, 
+        bucket_size=2.0, 
+        smoothing_sigma=2.0
+    ).to(args.device)
+
     print("\n--- Start Training ---")
     for epoch in range(args.epochs):
         model.train()
@@ -206,15 +215,21 @@ def train_mode(args, model, train_loader, val_loader, data_config):
             ppg = batch['ppg'].to(args.device).permute(0, 2, 1)
             ecg = batch['ecg'].to(args.device).permute(0, 2, 1)
             abp = batch['abp'].to(args.device).permute(0, 2, 1)
+            ppg_raw = batch['ppg_raw'].to(args.device).permute(0, 2, 1)
+            ecg_raw = batch['ecg_raw'].to(args.device).permute(0, 2, 1)
+            abp_raw = batch['abp_raw'].to(args.device).permute(0, 2, 1)
             
             optimizer.zero_grad()
             
-            pred_abp_final, pred_shape, pred_stats, recon_ecg, recon_ppg = model(torch.concat([ecg, ppg], dim=2))
+            abp_pred, recon_ecg, recon_ppg = model(torch.concat([ecg, ppg, ecg_raw, ppg_raw], dim=2))
+
+            batch_sbp_val = abp_raw.max(dim=1)[0]
+            target_weights = lds_calculator.get_weights(batch_sbp_val)
 
             loss = complex_loss(
                 ecg.squeeze(2), ppg.squeeze(2), abp.squeeze(2), 
-                recon_ecg, recon_ppg, pred_abp_final, pred_shape, pred_stats,
-                args
+                recon_ecg, recon_ppg, abp_pred,
+                args, target_weights=target_weights
             )
 
             loss.backward()
