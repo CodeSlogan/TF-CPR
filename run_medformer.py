@@ -126,13 +126,14 @@ def get_args():
 
     return parser.parse_args()
 
-
-def validate(model, dataloader, args, config: DataConfig, lambdas: dict, prefix="Validating"):
+def validate(model, dataloader, args, config: DataConfig, prefix="Validating"):
     model.eval()
     total_loss = 0
     steps = 0
     
-    all_errors = [] 
+    all_errors = []  # 整体ABP波形误差
+    sbp_errors = []  # SBP单独误差
+    dbp_errors = []  # DBP单独误差
     
     with torch.no_grad():
         for batch in tqdm(dataloader, desc=prefix, leave=False):
@@ -140,29 +141,64 @@ def validate(model, dataloader, args, config: DataConfig, lambdas: dict, prefix=
             ecg = batch['ecg'].to(args.device).permute(0, 2, 1)
             abp = batch['abp'].to(args.device).permute(0, 2, 1)
 
+            # 模型推理
+            pred_abp_final, pred_shape, pred_stats, recon_ecg, recon_ppg = model(torch.concat([ecg, ppg], dim=2))
 
-            abp_pred = model(torch.concat([ecg, ppg], dim=2)) 
-
+            # 计算损失
             loss = nn.MSELoss()(abp_pred, abp.squeeze())
             total_loss += loss.item()
 
-            pred_mmhg = denormalize_abp(abp_pred, config)
-            target_mmhg = denormalize_abp(abp.squeeze(), config)
+            # 反归一化得到mmHg单位的波形
+            pred_mmhg = denormalize_abp(pred_abp_final, config)  # shape: [batch_size, 1250]
+            target_mmhg = denormalize_abp(abp.squeeze(), config)  # shape: [batch_size, 1250]
             
+            # 1. 计算整体波形误差（原有逻辑保留）
             batch_error = pred_mmhg - target_mmhg
             all_errors.append(batch_error.detach().cpu())
+            
+            # 2. 计算SBP和DBP单独误差（新增逻辑）
+            pred_mmhg_np = pred_mmhg.detach().cpu().numpy()
+            target_mmhg_np = target_mmhg.detach().cpu().numpy()
+            
+            for pred_wave, target_wave in zip(pred_mmhg_np, target_mmhg_np):
+                # 计算预测的SBP/DBP
+                pred_sbp, pred_dbp = calculate_sbp_dbp_from_abp_waveform(pred_wave)
+                # 计算真实的SBP/DBP
+                target_sbp, target_dbp = calculate_sbp_dbp_from_abp_waveform(target_wave)
+                
+                # 收集有效误差（排除nan值）
+                if not np.isnan(pred_sbp) and not np.isnan(target_sbp):
+                    sbp_errors.append(pred_sbp - target_sbp)
+                if not np.isnan(pred_dbp) and not np.isnan(target_dbp):
+                    dbp_errors.append(pred_dbp - target_dbp)
+            
             steps += 1
 
+    # 计算原有指标（整体MAE/SD）
     avg_loss = total_loss / steps if steps > 0 else 0
-
+    final_mae, final_sd = 0.0, 0.0
     if len(all_errors) > 0:
         all_errors_tensor = torch.cat(all_errors).flatten()
         final_mae = torch.mean(torch.abs(all_errors_tensor)).item()
         final_sd = torch.std(all_errors_tensor).item()
-    else:
-        final_mae, final_sd = 0.0, 0.0
+    
+    # 计算SBP单独指标（MAE/SD）
+    sbp_mae, sbp_sd = 0.0, 0.0
+    if len(sbp_errors) > 0:
+        sbp_errors_np = np.array(sbp_errors)
+        sbp_mae = np.mean(np.abs(sbp_errors_np))
+        sbp_sd = np.std(sbp_errors_np)
+    
+    # 计算DBP单独指标（MAE/SD）
+    dbp_mae, dbp_sd = 0.0, 0.0
+    if len(dbp_errors) > 0:
+        dbp_errors_np = np.array(dbp_errors)
+        dbp_mae = np.mean(np.abs(dbp_errors_np))
+        dbp_sd = np.std(dbp_errors_np)
 
-    return avg_loss, final_mae, final_sd
+    # 返回原有指标 + SBP/DBP单独指标
+    return avg_loss, final_mae, final_sd, sbp_mae, sbp_sd, dbp_mae, dbp_sd
+
 
 
 def train_mode(args, model, train_loader, val_loader, loss_lambdas, data_config):
@@ -207,16 +243,18 @@ def train_mode(args, model, train_loader, val_loader, loss_lambdas, data_config)
         scheduler.step()
         
         # --- Validation ---
-        val_loss, val_mae, val_sd = validate(model, val_loader, args, data_config, loss_lambdas)
+        avg_loss, final_mae, final_sd, sbp_mae, sbp_sd, dbp_mae, dbp_sd = validate(model, val_loader, args, data_config, loss_lambdas)
         
         print(f"Epoch {epoch+1} Result:")
         print(f"  Train Loss: {train_loss_acc/steps:.4f}")
-        print(f"  Val Loss:   {val_loss:.4f}")
-        print(f"  Val MAE:    {val_mae:.2f} mmHg")
-        print(f"  Val SD:     {val_sd:.2f} mmHg")
+        print(f"  Val Loss:   {avg_loss:.4f}")
+        print(f"  Val MAE:    {final_mae:.2f} mmHg")
+        print(f"  Val SD:     {final_sd:.2f} mmHg")
+        print(f"  Val SBP MAE:{sbp_mae:.2f} mmHg, SD: {sbp_sd:.2f} mmHg")
+        print(f"  Val DBP MAE:{dbp_mae:.2f} mmHg, SD: {dbp_sd:.2f} mmHg")
         
         # --- Early Stopping Check & Saving ---
-        early_stopping(val_mae, model, optimizer, epoch, data_config, args)
+        early_stopping(final_mae, model, args.model_name, optimizer, epoch, data_config, args)
         
         if early_stopping.early_stop:
             print(f"\n[Early Stopping] Triggered after {epoch+1} epochs.")

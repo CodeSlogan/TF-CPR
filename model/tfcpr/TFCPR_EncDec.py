@@ -22,39 +22,21 @@ class BPBookLayer(nn.Module):
         # x: [Batch, Seq_Len, D_model]
         B, L, D = x.shape
         
-        # 1. 获取全局查询向量 (Query Generation)
-        # 建议使用 Mean Pooling 获取 Seq_Len 的全局信息，比 Last Token 更抗噪
         query = torch.mean(x, dim=1) # (B, D)
         
-        # Normalize for Cosine Similarity
         query_norm = F.normalize(query, p=2, dim=-1)   # (B, D)
         proto_norm = F.normalize(self.prototypes, p=2, dim=-1) # (K, D)
         
-        # 2. 计算相似度 (Similarity Calculation)
-        # (B, D) @ (D, K) -> (B, K)
         scores = torch.matmul(query_norm, proto_norm.t())
-        
-        # 3. Top-K 检索 (Top-K Selection)
-        # values: (B, topk), indices: (B, topk)
         topk_scores, topk_indices = torch.topk(scores, self.topk, dim=-1)
-        
-        # 4. 加权融合 (Weighted Aggregation)
-        # 使用 Softmax 归一化 Top-K 的得分，作为权值
         attn_weights = F.softmax(topk_scores, dim=-1).unsqueeze(-1) # (B, topk, 1)
         
-        # 根据索引取出对应的 Prototypes: (B, topk, D)
-        # 扩展 prototypes 以便 gather: (1, K, D) -> (B, K, D)
         expanded_protos = self.prototypes.unsqueeze(0).expand(B, -1, -1)
-        # gather 需要 indices 维度匹配: (B, topk) -> (B, topk, D)
         gather_indices = topk_indices.unsqueeze(-1).expand(-1, -1, D)
         
         retrieved_topk_protos = torch.gather(expanded_protos, 1, gather_indices) # (B, topk, D)
         
-        # 加权求和: sum((B, topk, 1) * (B, topk, D)) -> (B, D)
         proto_agg = torch.sum(attn_weights * retrieved_topk_protos, dim=1)
-        
-        # 5. 注入校准 (Injection)
-        # 将聚合的原型广播回序列: (B, D) -> (B, 1, D) -> broadcast add to (B, L, D)
         out = x + self.alpha * proto_agg.unsqueeze(1)
         
         return out
@@ -83,7 +65,7 @@ class EncoderLayer(nn.Module):
         y = x = [self.norm1(_x) for _x in x]
         
         # 修改点：在 FFN 之前应用 BP-Book (对每个 patch head 的输出做处理，或者先 concat)
-        # 注意：Medformer 的输入 x 是 list [patch_len_1, patch_len_2...]
+        # 注意：TFCPR 的输入 x 是 list [patch_len_1, patch_len_2...]
         # BP-Book 最好作用在融合后的语义上，但为了不破坏 EncoderLayer 结构，我们对每个尺度的 x 独立应用
         if self.use_bp_book:
             y = [self.bp_book(_y) for _y in y]

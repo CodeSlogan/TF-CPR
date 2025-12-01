@@ -1,5 +1,6 @@
 import os
 import glob
+import random
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -27,6 +28,7 @@ class DataConfig:
     
     abp_global_median: float = None 
     abp_global_iqr: float = None
+    is_train : bool = True
 
 
 class MimicBPDataset(Dataset):
@@ -81,6 +83,32 @@ class MimicBPDataset(Dataset):
 
     def __len__(self):
         return len(self.indices)
+    
+    def _augment(self, ppg, ecg):
+        """
+        专门针对生理信号的增强策略
+        """
+        # 1. 随机缩放 (Random Scaling): 模拟不同传感器增益/接触紧密度
+        # 即使波形变大变小，模型也应该能通过形态判断出血压
+        scale_factor = random.uniform(0.8, 1.2)
+        ppg = ppg * scale_factor
+        # ECG 通常相对稳定，但也稍微给点扰动
+        ecg = ecg * random.uniform(0.9, 1.1)
+
+        # 2. 随机直流漂移 (Random Baseline Wander)
+        # 模拟呼吸或运动导致的基线漂移
+        bias = random.uniform(-0.1, 0.1)
+        ppg = ppg + bias
+
+        # 3. 随机时间扭曲 (Time Warping) 或 频率缩放
+        # 模拟不同的心率变异性
+        # (代码略，通常用 scipy.signal.resample 实现，会增加 CPU 负担，可先不做)
+
+        # 4. 随机噪声 (Gaussian Noise)
+        noise = np.random.normal(0, 0.01, ppg.shape).astype(np.float32)
+        ppg = ppg + noise
+        
+        return ppg, ecg
 
     def __getitem__(self, idx):
         subject_id, row_idx, start_col = self.indices[idx]
@@ -97,6 +125,9 @@ class MimicBPDataset(Dataset):
         ppg_slice = ppg_data[row_idx, start_col:end_col]
         ecg_slice = ecg_data[row_idx, start_col:end_col]
         abp_slice = abp_data[row_idx, start_col:end_col]
+
+        if self.config.is_train:
+            ppg_slice, ecg_slice = self._augment(ppg_slice, ecg_slice)
         
         ppg_norm = self._apply_instance_zscore(ppg_slice, ppg_full_row)
         ecg_norm = self._apply_instance_zscore(ecg_slice, ecg_full_row)

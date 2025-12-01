@@ -75,7 +75,7 @@ class AttentionLayer(nn.Module):
         return self.out_projection(out), attn
 
 
-class MedformerLayer(nn.Module):
+class TFCPRLayer(nn.Module):
     def __init__(
         self,
         num_blocks,

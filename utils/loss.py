@@ -1,69 +1,76 @@
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from tqdm import tqdm
 
 
-def complex_loss(ecg_raw, ppg_raw, abp_raw, 
-                           ecg_pred, ppg_pred, abp_pred, 
-                           lambdas: dict):
+class NegPearsonLoss(nn.Module):
+    def __init__(self):
+        super(NegPearsonLoss, self).__init__()
+
+    def forward(self, preds, targets):
+
+        preds_flat = preds.view(preds.shape[0], -1)
+        targets_flat = targets.view(targets.shape[0], -1)
+        
+        vx = preds_flat - torch.mean(preds_flat, dim=1, keepdim=True)
+        vy = targets_flat - torch.mean(targets_flat, dim=1, keepdim=True)
+        
+        cost = torch.sum(vx * vy, dim=1) / (torch.sqrt(torch.sum(vx ** 2, dim=1)) * torch.sqrt(torch.sum(vy ** 2, dim=1)) + 1e-8)
+        
+        return 1 - torch.mean(cost)
+
+_pearson_loss_fn = NegPearsonLoss()
+
+def complex_loss(ecg_raw, ppg_raw, abp_global_norm, 
+                 ecg_pred, ppg_pred, pred_final, pred_shape, pred_stats, 
+                 args):
     """
-    计算基于时频双域与ALMR自监督的复合损失函数
+    增强版复合损失函数：加入 PCC 约束与 Log-FFT
     """
-    # 维度对齐: [B, L, 1] -> [B, L]
-    if abp_raw.dim() == 3: abp_raw = abp_raw.squeeze(-1)
-    if abp_pred.dim() == 3: abp_pred = abp_pred.squeeze(-1)
+    # ---  ALMR 辅助任务 ---
+    loss_almr = torch.tensor(0.0, device=pred_final.device)
     
-    # 1.1 数值精度 (MSE)
-    loss_bp_mse = F.mse_loss(abp_pred, abp_raw)
-    
-    # 1.2 波形形态 (一阶差分 L1)
-    diff_pred = abp_pred[:, 1:] - abp_pred[:, :-1]
-    diff_raw = abp_raw[:, 1:] - abp_raw[:, :-1]
-    loss_bp_deriv = F.l1_loss(diff_pred, diff_raw)
-    
-    # 1.3 频域一致性
-    fft_pred = torch.fft.rfft(abp_pred, dim=-1)
-    fft_raw = torch.fft.rfft(abp_raw, dim=-1)
-    loss_bp_freq = F.mse_loss(fft_pred.abs(), fft_raw.abs())
-    
-    # --- ALMR 辅助任务 ---
-    loss_almr = torch.tensor(0.0, device=abp_pred.device)
-    
-    if (ecg_pred is not None) and (ppg_pred is not None) and (lambdas['almr'] > 0):
-        # 仅当权重 > 0 且有输出时计算
+    if (ecg_pred is not None) and (ppg_pred is not None):
+        # 确保 target 维度正确
         ecg_target = ecg_raw.squeeze(-1) if ecg_raw.dim() == 3 else ecg_raw
         ppg_target = ppg_raw.squeeze(-1) if ppg_raw.dim() == 3 else ppg_raw
         
-        B, target_len = ecg_pred.shape
-        
-        # 长度适配
-        if ecg_target.shape[1] > target_len:
-            ecg_target = ecg_target[:, :target_len]
-            ppg_target = ppg_target[:, :target_len]
-        elif ecg_target.shape[1] < target_len:
-            pad_len = target_len - ecg_target.shape[1]
-            ecg_target = F.pad(ecg_target, (0, pad_len))
-            ppg_target = F.pad(ppg_target, (0, pad_len))
-            
-        ecg_target_reshaped = ecg_target.view(B, target_len)
-        ppg_target_reshaped = ppg_target.view(B, target_len)
-        
-        loss_almr_ecg = F.mse_loss(ecg_pred, ecg_target_reshaped)
-        loss_almr_ppg = F.mse_loss(ppg_pred, ppg_target_reshaped)
+        # 简单的长度截断 (假设 pred 长度 <= target 长度)
+        target_len = ecg_pred.shape[1]
+        loss_almr_ecg = F.mse_loss(ecg_pred, ecg_target[:, :target_len])
+        loss_almr_ppg = F.mse_loss(ppg_pred, ppg_target[:, :target_len])
         loss_almr = loss_almr_ecg + loss_almr_ppg
 
-    # --- 总损失聚合 ---
-    total_loss = (lambdas['bp_mse'] * loss_bp_mse +
-                  lambdas['bp_deriv'] * loss_bp_deriv + 
-                  lambdas['bp_freq'] * loss_bp_freq +
-                  lambdas['almr'] * loss_almr)
+    if abp_global_norm.dim() == 3: abp_global_norm = abp_global_norm.squeeze(-1)
     
-    loss_dict = {
-        "total": total_loss.item(),
-        "mse": loss_bp_mse.item(),
-        "deriv": loss_bp_deriv.item(),
-        "freq": loss_bp_freq.item(),
-        "almr": loss_almr.item()
-    }
+    # ------------------------------------------------------
+    # 1. 动态计算 Instance 统计量 (On-the-fly)
+    # ------------------------------------------------------
+    # 注意：这里的 gt_mean 是 "全局归一化数据" 的均值
+    # 物理含义：(这个人的平均血压 - Global_Median) / Global_IQR
+    gt_mean = abp_global_norm.mean(dim=1, keepdim=True) 
+    gt_std  = abp_global_norm.std(dim=1, keepdim=True) + 1e-6
     
-    return total_loss, loss_dict
+    gt_shape = (abp_global_norm - gt_mean) / gt_std
+    
+    # A. 最终重构 Loss (整体对齐)
+    loss_total_mse = F.mse_loss(pred_final, abp_global_norm)
+    loss_total_pcc = _pearson_loss_fn(pred_final, abp_global_norm)
+    
+    # B. 统计量 Loss (让 Scalar Head 学习相对偏移)
+    target_stats = torch.cat([gt_mean, gt_std], dim=1) # (B, 2)
+    loss_stats = F.mse_loss(pred_stats, target_stats)
+    
+    # C. 形状 Loss (让 Decoder 学习纯波形)
+    loss_shape = F.mse_loss(pred_shape, gt_shape)
+
+    total_loss = (
+        args.lambda_mse * loss_total_mse +
+        args.lambda_pcc * loss_total_pcc +
+        args.lambda_scalar * loss_stats +
+        args.lambda_deriv * loss_shape +
+        args.lambda_almr * loss_almr
+    )
+    
+
+    return total_loss

@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .Medformer_EncDec import EncoderLayer, Encoder
-from .SelfAttention_Family import MedformerLayer, FullAttention, AttentionLayer
+from .TFCPR_EncDec import EncoderLayer, Encoder
+from .SelfAttention_Family import TFCPRLayer, FullAttention, AttentionLayer
 from .Embed import ListPatchEmbedding
 
 
@@ -97,18 +97,13 @@ class ALMR_Module(nn.Module):
         super().__init__()
         self.d_model = d_model
         
-        # 这里的 Beat Query 保持不变，用于提取全局节律
         self.q_beat = nn.Parameter(torch.randn(num_beats, d_model))
-        
-        # 简化 Attention，只用一层 Cross Attention 提取节律
         self.cross_attn = nn.MultiheadAttention(d_model, num_heads=4, batch_first=True)
         
-        # 重构头：与其用 Attention 插值，不如训练一个小型 MLP/Conv 把 Beat 解码回信号
-        # 如果目的是辅助训练，越简单越好
         self.recon_head = nn.Sequential(
-            nn.Linear(d_model, seq_len // num_beats * 2), # 粗略上采样
+            nn.Linear(d_model, seq_len // num_beats * 2), 
             nn.GELU(),
-            nn.Linear(seq_len // num_beats * 2, seq_len // num_beats) # 假设均匀分布，这里只是辅助Loss
+            nn.Linear(seq_len // num_beats * 2, seq_len // num_beats) 
         )
         self.final_recon_proj = nn.Linear(num_beats * (seq_len // num_beats), seq_len)
 
@@ -123,15 +118,11 @@ class ALMR_Module(nn.Module):
         
         x_recon = None
         if is_train:
-            # 简单的重构逻辑：Beat Embed -> Local Signal -> Stitch
-            # 这比 Attention 插值更稳定
             local_sig = self.recon_head(z_beat) # (B, K, Sub_L)
             flat_sig = local_sig.view(B, -1)
             # 调整长度回 seq_len
             x_recon = self.final_recon_proj(flat_sig) 
 
-        # 3. Injection (简单相加或门控，不要搞太复杂的 Attention 广播)
-        # 将 Beat 信息广播回每个 Patch，这里简化为 Global Average 的变体
         beat_global = z_beat.mean(dim=1, keepdim=True) # (B, 1, D)
         x_enhanced = x_concat + beat_global
         
@@ -141,9 +132,7 @@ class ALMR_Module(nn.Module):
         
         return x_final_list, x_recon
 
-# ---------------------------------------------------------
-# 4. 优化的 Decoder (U-Net 结构)
-# ---------------------------------------------------------
+
 class Decoder(nn.Module):
     def __init__(self, d_model, target_len, fft_dim, cwt_dim):
         super().__init__()
@@ -199,9 +188,9 @@ class Decoder(nn.Module):
         return self.out(x).squeeze(1)
 
 
-class Medformer(nn.Module):
+class TFCPR(nn.Module):
     def __init__(self, configs):
-        super(Medformer, self).__init__()
+        super(TFCPR, self).__init__()
         self.configs = configs
         self.is_train = configs.is_train
         
@@ -218,15 +207,15 @@ class Medformer(nn.Module):
         
         self.ecg_encoder = Encoder(
             [EncoderLayer(
-                MedformerLayer(len(patch_len_list), configs.d_model, configs.n_heads, configs.dropout),
-                configs.d_model, configs.d_ff, dropout=configs.dropout, use_bp_book=True, num_prototypes=configs.num_prototypes, bp_book_topk=configs.topK
+                TFCPRLayer(len(patch_len_list), configs.d_model, configs.n_heads, configs.dropout),
+                configs.d_model, configs.d_ff, dropout=configs.dropout, use_bp_book=False, num_prototypes=configs.num_prototypes, bp_book_topk=configs.topK
             ) for _ in range(configs.e_layers)],
             norm_layer=nn.LayerNorm(configs.d_model)
         )
         self.ppg_encoder = Encoder(
             [EncoderLayer(
-                MedformerLayer(len(patch_len_list), configs.d_model, configs.n_heads, configs.dropout),
-                configs.d_model, configs.d_ff, dropout=configs.dropout, use_bp_book=True, num_prototypes=configs.num_prototypes, bp_book_topk=configs.topK
+                TFCPRLayer(len(patch_len_list), configs.d_model, configs.n_heads, configs.dropout),
+                configs.d_model, configs.d_ff, dropout=configs.dropout, use_bp_book=False, num_prototypes=configs.num_prototypes, bp_book_topk=configs.topK
             ) for _ in range(configs.e_layers)],
             norm_layer=nn.LayerNorm(configs.d_model)
         )
@@ -242,6 +231,16 @@ class Medformer(nn.Module):
         
         # Decoder 
         self.decoder = Decoder(configs.d_model, configs.seq_len, configs.d_model*2, cwt_dim=configs.cwt_channels)
+
+        self.scalar_head = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),      # (B, N, D) -> (B, D, 1) 全局池化
+            nn.Flatten(),                 # (B, D)
+            nn.Linear(configs.d_model, 128),
+            nn.LayerNorm(128),            # 加个 Norm 稳一点
+            nn.GELU(),
+            nn.Dropout(configs.dropout),
+            nn.Linear(128, 2)             # [Mean, Std]
+        )
 
     def forward(self, x_enc):
         x_ecg = x_enc[:, :, 0] 
@@ -271,9 +270,25 @@ class Medformer(nn.Module):
         h_fused = self.fusion_mlp(h_fused) # (B, N, D)
         
         # 5. Decoder (with CWT injection)
-        y_pred = self.decoder(h_fused, v_style, m_cwt_ecg, m_cwt_ppg)
+        pred_shape = self.decoder(h_fused, v_style, m_cwt_ecg, m_cwt_ppg) 
         
+        # ---------------------------------------------------
+        # Stage 2: 数值预测 (Scalar Prediction)
+        # ---------------------------------------------------
+        pred_stats = self.scalar_head(h_fused.transpose(1, 2)) # (B, 2)
+        
+        pred_mean = pred_stats[:, 0].unsqueeze(1) # (B, 1)
+        pred_std  = pred_stats[:, 1].unsqueeze(1) # (B, 1)
+        pred_std = F.softplus(pred_std)
+        # ---------------------------------------------------
+        # Reconstruction: 物理重构
+        # ---------------------------------------------------
+        # 最终 ABP = Shape * Std + Mean
+        # 这一步是可导的，梯度会分别传给 Decoder 和 ScalarHead
+        pred_abp_final = pred_shape * pred_std + pred_mean
+
         if self.is_train:
-            return y_pred, recon_ecg, recon_ppg
+            # 返回: 最终ABP, 归一化形状, 预测的统计量
+            return pred_abp_final, pred_shape, pred_stats, recon_ecg, recon_ppg
         else:
-            return y_pred
+            return pred_abp_final
