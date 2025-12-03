@@ -30,6 +30,7 @@ class DataConfig:
     abp_global_iqr: float = None
     is_train : bool = True
     all_sbp_labels: List[float] = None  # 用于 LDS 计算
+    all_dbp_labels: List[float] = None  # 用于 LDS 计算
 
 
 class MimicBPDataset(Dataset):
@@ -156,6 +157,7 @@ class StatisticsCalculator:
         
         # 2. 用于 LDS 的 SBP 标签容器
         collected_sbp_labels = []
+        collected_dbp_labels = []
 
         for pid in tqdm(subject_ids, desc="Scanning ABP files"):
             file_path = abp_dir / f"p{pid}_abp.npy"
@@ -182,8 +184,10 @@ class StatisticsCalculator:
                     # 取每个窗口的最大值作为该样本的 SBP
                     # axis=1 表示在窗口维度取 max
                     window_maxes = np.max(reshaped_data, axis=1) 
+                    window_mins = np.min(reshaped_data, axis=1)
                     
                     collected_sbp_labels.extend(window_maxes.tolist())
+                    collected_dbp_labels.extend(window_mins.tolist())
                         
                 except Exception as e:
                     print(f"Warning: Error reading {pid}: {e}")
@@ -203,9 +207,9 @@ class StatisticsCalculator:
         iqr = q75 - q25
         
         print(f"Global Stats: Median={median:.4f}, IQR={iqr:.4f}")
-        print(f"Collected {len(collected_sbp_labels)} SBP labels for LDS.")
+        print(f"Collected {len(collected_sbp_labels)} SBP & DBP labels for LDS.")
         
-        return float(median), float(iqr), collected_sbp_labels
+        return float(median), float(iqr), collected_sbp_labels, collected_dbp_labels
 
 
 class DataFactory:
@@ -223,12 +227,13 @@ class DataFactory:
         val_ids, test_ids = train_test_split(test_ids, test_size=(1 - relative_val_ratio), random_state=config.seed)
         
         # --- 核心步骤：同时计算统计量和收集 SBP 列表 ---
-        median, iqr, sbp_labels = StatisticsCalculator.compute_abp_stats(train_ids, config)
+        median, iqr, sbp_labels, dbp_labels = StatisticsCalculator.compute_abp_stats(train_ids, config)
         
         config.abp_global_median = median
         config.abp_global_iqr = iqr
         config.all_sbp_labels = sbp_labels  
-        
+        config.all_dbp_labels = dbp_labels
+
         # 创建 Dataset
         train_ds = MimicBPDataset(train_ids, config, mode='train')
         val_ds = MimicBPDataset(val_ids, config, mode='val')

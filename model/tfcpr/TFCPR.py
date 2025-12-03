@@ -6,6 +6,188 @@ from .SelfAttention_Family import TFCPRLayer, FullAttention, AttentionLayer
 from .Embed import ListPatchEmbedding
 import math
 
+class MultiScaleConv(nn.Module):
+    """
+    [SOTA] 可学习的 Morlet 小波变换层
+    不使用随机初始化的 Conv1d，而是基于物理公式生成 Morlet 小波核。
+    允许模型微调小波的形状，以适应具体的血压任务。
+    """
+    def __init__(self, in_channels, out_channels, kernel_size=63):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.padding = kernel_size // 2
+        
+        # 1. 初始化可学习的尺度参数 (Scales)
+        scales = torch.logspace(0, math.log10(kernel_size // 2), steps=out_channels)
+        self.scales = nn.Parameter(scales)
+        
+        # 2. 1x1 卷积用于通道融合 (代替你的 fusion)
+        self.fusion = nn.Conv1d(in_channels * out_channels, out_channels, 1)
+
+    def _generate_morlet_filters(self):
+        """
+        动态生成 Morlet 小波卷积核
+        Formula: Psi(t) = C * exp(-t^2 / 2) * cos(5t)  (简化版实数 Morlet)
+        """
+        device = self.scales.device
+        
+        # 创建时间轴 [-1, 1]
+        t = torch.linspace(-1, 1, self.kernel_size).to(device)
+        t = t.view(1, 1, -1)  # [1, 1, L]
+        
+        # 扩展 scales: [Out, 1, 1]
+        s = self.scales.view(-1, 1, 1)
+        
+        # 核心：根据当前 Scale 动态计算波形
+        # Scale 越小，频率越高，波形越窄
+        # 这里的 5.0 是 Morlet 的基准频率，可以设为可学习参数
+        envelope = torch.exp(- (t ** 2) / (2 * (s ** 2) + 1e-6))
+        oscillation = torch.cos(5.0 * t / (s + 1e-6))
+        
+        filters = envelope * oscillation  # [Out, 1, Kernel]
+        
+        # 归一化能量，防止梯度爆炸
+        filters = filters / (torch.norm(filters, dim=-1, keepdim=True) + 1e-6)
+        
+        return filters
+
+    def forward(self, x):
+        # x: [B, 1, L] or [B, C, L]
+        B, C, L = x.shape
+        
+        # 1. 动态生成滤波器
+        filters = self._generate_morlet_filters() # [Out, 1, K]
+        
+        # 2. 这里的卷积相当于 CWT
+        
+        # 为了适配 Conv1d 的权重格式 [Out_channels, In_channels/Groups, K]
+        # 假设输入是 [B, 1, L]，输出想要 [B, 32, L]
+        filters = filters.view(self.out_channels, 1, self.kernel_size)
+        
+        # 执行卷积
+        # 输出形状: [B, Out, L]
+        out = F.conv1d(x, filters, padding=self.padding)
+        
+        # 3. 激活与融合
+        out = F.gelu(out)
+        
+        # 如果需要更复杂的融合，可以在这里加
+        return out
+
+
+class FreqFeatureExtractor(nn.Module):
+    def __init__(self, seq_len, d_model=128, cwt_channels=32, num_freq_patches=16):
+        super().__init__()
+        
+        fft_len = seq_len // 2 + 1
+        self.input_dim = fft_len * 2
+        
+        self.patch_conv = nn.Sequential(
+            nn.Conv1d(1, 128, kernel_size=16, stride=8), # 模拟 Patching，提取局部频谱特征
+            nn.BatchNorm1d(128),
+            nn.GELU()
+        )
+        
+        self.attention_mlp = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),     
+            nn.Flatten(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 128),          
+            nn.Sigmoid()                 
+        )
+        
+        self.out_proj = nn.Linear(128, d_model)
+        self.ms_conv = MultiScaleConv(1, cwt_channels)
+
+    def forward(self, x_raw):
+        """
+        x: [B, 1, L] (归一化后的数据，给 CWT 用)
+        x_raw: [B, 1, L] (原始数据，给 FFT 用，保留幅值能量)
+        """
+        B = x_raw.shape[0]
+        
+        # --- Part A: FFT Path (Frequency Attention) ---
+        x_fft = torch.fft.rfft(x_raw.squeeze(1), dim=-1)
+        x_fft_mag = x_fft.abs() # [B, 1, L//2+1]
+        x_fft_mag = x_fft_mag.unsqueeze(1)
+        
+        fft_feats = self.patch_conv(x_fft_mag) 
+        attn_weights = self.attention_mlp(fft_feats)
+        fft_weighted = fft_feats * attn_weights.unsqueeze(-1)
+        
+        v_fft = fft_weighted.mean(dim=-1) # [B, 128]
+        v_fft = self.out_proj(v_fft)      # [B, d_model]
+        
+        # --- Part B: CWT Path (保持不变) ---
+        m_local = self.ms_conv(x_raw.unsqueeze(1)) # [B, Cwt_Channels, L]
+        
+        return v_fft, m_local
+
+
+class ALMR_Module(nn.Module):
+    def __init__(self, d_model, raw_seq_len=1250, num_beats=16):
+        super().__init__()
+        self.d_model = d_model
+        self.num_beats = num_beats
+        self.raw_seq_len = raw_seq_len
+        
+        self.q_beat = nn.Parameter(torch.randn(1, num_beats, d_model))
+        
+        self.attn_token2beat = nn.MultiheadAttention(d_model, num_heads=4, batch_first=True)
+        self.attn_beat2token = nn.MultiheadAttention(d_model, num_heads=4, batch_first=True)
+        
+        # 定义一组固定的“时间锚点”，代表原始信号的每一个采样点
+        # Shape: [1, Raw_Len, D]
+        # 使用 Sinusoidal 位置编码初始化，代表绝对时间位置
+        self.time_queries = nn.Parameter(self._init_positional_encoding(raw_seq_len, d_model), requires_grad=False)
+        
+        # Beat -> Signal 的解码注意力
+        self.recon_attn = nn.MultiheadAttention(d_model, num_heads=4, batch_first=True)
+        self.out_proj = nn.Linear(d_model, 1)
+
+    def _init_positional_encoding(self, length, d_model):
+        """生成标准的时间位置编码作为查询锚点"""
+        pe = torch.zeros(length, d_model)
+        position = torch.arange(0, length, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        return pe.unsqueeze(0) # [1, L, D]
+
+    def forward(self, x_token, is_train=True):
+        """
+        x_token: [B, N_mixed, D] (由多粒度拼接而成的 Token，N 大小不定)
+        x_raw:   [B, L] (原始信号)
+        """
+        B, N, D = x_token.shape
+        
+        q = self.q_beat.repeat(B, 1, 1) # [B, K, D]
+        z_beat, _ = self.attn_token2beat(q, x_token, x_token)
+        
+        # --- 2. Feature Injection (回注增强) ---
+        context, _ = self.attn_beat2token(x_token, z_beat, z_beat)
+        x_enhanced = x_token + context
+        
+        # --- 3. Coordinate-Based Reconstruction (坐标解码) ---
+        
+        if is_train :
+            # 这里的逻辑是：用"时间坐标"去查询"Beat特征"
+            # 只有当 Beat 特征真正包含了完整的波形形态时，它才能正确回答每个时间点的数值
+            # Q: [B, Raw_Len, D] (时间坐标)
+            time_q = self.time_queries.repeat(B, 1, 1).to(x_token.device)
+            
+            # K, V: [B, K, D] (Beat 特征)
+            # 输出: [B, Raw_Len, D]
+            recon_feat, _ = self.recon_attn(time_q, z_beat, z_beat)
+            
+            # 映射回波形数值: [B, Raw_Len, 1] -> [B, Raw_Len]
+            x_recon = self.out_proj(recon_feat).squeeze(-1)
+            
+        return x_enhanced, x_recon
+
 
 class FiLM(nn.Module):
     """
@@ -41,168 +223,6 @@ class ResBlockWithFiLM(nn.Module):
         x = self.film(x, style) # 注入频域 Style
         x = self.conv2(x)
         return x + resid
-
-
-class MultiScaleConv(nn.Module):
-    """
-    模拟 CWT/STFT 的多分辨率特性：使用不同 Kernel Size 并行提取
-    """
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        # 小卷积核捕获高频突变 (QRS)，大卷积核捕获低频趋势 (P/T wave)
-        self.branch1 = nn.Conv1d(in_channels, out_channels//2, kernel_size=3, padding=1)
-        self.branch2 = nn.Conv1d(in_channels, out_channels//2, kernel_size=11, padding=5)
-        self.fusion = nn.Conv1d(out_channels, out_channels, 1)
-
-    def forward(self, x):
-        # x: (B, 1, L)
-        # 增加 Channel 维度如果输入是 (B, L)
-        if x.dim() == 2: x = x.unsqueeze(1)
-        
-        b1 = F.gelu(self.branch1(x))
-        b2 = F.gelu(self.branch2(x))
-        out = torch.cat([b1, b2], dim=1)
-        return self.fusion(out)
-
-
-class FreqFeatureExtractor(nn.Module):
-    def __init__(self, seq_len, d_model=128, cwt_channels=32, num_freq_patches=16):
-        super().__init__()
-        
-        fft_len = seq_len // 2 + 1
-        self.input_dim = fft_len * 2
-        
-        self.patch_conv = nn.Sequential(
-            nn.Conv1d(1, 128, kernel_size=16, stride=8), # 模拟 Patching，提取局部频谱特征
-            nn.BatchNorm1d(128),
-            nn.GELU()
-        )
-        
-        self.attention_mlp = nn.Sequential(
-            nn.AdaptiveAvgPool1d(1),     
-            nn.Flatten(),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, 128),          
-            nn.Sigmoid()                 
-        )
-        
-        # 4. 最终映射
-        self.out_proj = nn.Linear(128, d_model)
-
-        # CWT 部分 (保持不变)
-        self.ms_conv = MultiScaleConv(1, cwt_channels)
-
-    def forward(self, x, x_raw):
-        """
-        x: [B, 1, L] (归一化后的数据，给 CWT 用)
-        x_raw: [B, 1, L] (原始数据，给 FFT 用，保留幅值能量)
-        """
-        B = x.shape[0]
-        
-        # --- Part A: FFT Path (Frequency Attention) ---
-        
-        # 1. 计算 FFT
-        # x_raw: [B, 1, L] -> rfft -> [B, 1, L//2+1]
-        x_fft = torch.fft.rfft(x_raw.squeeze(1), dim=-1)
-        x_fft_mag = x_fft.abs() # [B, 1, L//2+1]
-        x_fft_mag = x_fft_mag.unsqueeze(1)
-        
-        # 3. 频域 Patching (Conv1d)
-        fft_feats = self.patch_conv(x_fft_mag) 
-        
-        # 4. 计算注意力权重
-        # [B, 128, Reduced_Len] -> Global Pool -> [B, 128] -> MLP -> [B, 128]
-        attn_weights = self.attention_mlp(fft_feats)
-        
-        # 5. 加权融合 (Attention-Weighted Aggregation)
-        # feat: [B, 128, Len], weight: [B, 128, 1]
-        # 这是一个 Channel Attention 操作
-        fft_weighted = fft_feats * attn_weights.unsqueeze(-1)
-        
-        # 6. Global Pooling & Projection
-        # 聚合所有频段的信息得到最终的 Style Vector
-        v_fft = fft_weighted.mean(dim=-1) # [B, 128]
-        v_fft = self.out_proj(v_fft)      # [B, d_model]
-        
-        # --- Part B: CWT Path (保持不变) ---
-        m_local = self.ms_conv(x) 
-        
-        return v_fft, m_local
-
-
-class ALMR_Module(nn.Module):
-    def __init__(self, d_model, raw_seq_len=1250, num_beats=16):
-        super().__init__()
-        self.d_model = d_model
-        self.num_beats = num_beats
-        self.raw_seq_len = raw_seq_len
-        
-        # 1. Latent Beat Queries (心脏: 学习心跳原型)
-        self.q_beat = nn.Parameter(torch.randn(1, num_beats, d_model))
-        
-        # 2. Token -> Beat (聚合: 从混乱的多尺度 Token 中提取有序的 Beat)
-        self.attn_token2beat = nn.MultiheadAttention(d_model, num_heads=4, batch_first=True)
-        
-        # 3. Beat -> Token (注入: 增强 Token)
-        self.attn_beat2token = nn.MultiheadAttention(d_model, num_heads=4, batch_first=True)
-        
-        # --- [关键修改] 基于坐标的重建解码器 ---
-        
-        # 定义一组固定的“时间锚点”，代表原始信号的每一个采样点
-        # Shape: [1, Raw_Len, D]
-        # 使用 Sinusoidal 位置编码初始化，代表绝对时间位置
-        self.time_queries = nn.Parameter(self._init_positional_encoding(raw_seq_len, d_model), requires_grad=False)
-        
-        # Beat -> Signal 的解码注意力
-        # Q = Time Queries (我想知道第 t 秒的值)
-        # K, V = Beat Embeddings (我知道心跳的形态)
-        self.recon_attn = nn.MultiheadAttention(d_model, num_heads=4, batch_first=True)
-        
-        # 最终映射到数值
-        self.out_proj = nn.Linear(d_model, 1)
-
-    def _init_positional_encoding(self, length, d_model):
-        """生成标准的时间位置编码作为查询锚点"""
-        pe = torch.zeros(length, d_model)
-        position = torch.arange(0, length, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        return pe.unsqueeze(0) # [1, L, D]
-
-    def forward(self, x_token, is_train=True):
-        """
-        x_token: [B, N_mixed, D] (由多粒度拼接而成的 Token，N 大小不定)
-        x_raw:   [B, L] (原始信号)
-        """
-        B, N, D = x_token.shape
-        
-        # --- 1. Beat Extraction (从多尺度特征中提取 Beat) ---
-        q = self.q_beat.repeat(B, 1, 1) # [B, K, D]
-        z_beat, _ = self.attn_token2beat(q, x_token, x_token)
-        
-        # --- 2. Feature Injection (回注增强) ---
-        # 所有的 Token (无论大粒度还是小粒度) 都从中受益
-        context, _ = self.attn_beat2token(x_token, z_beat, z_beat)
-        x_enhanced = x_token + context
-        
-        # --- 3. Coordinate-Based Reconstruction (坐标解码) ---
-        
-        if is_train :
-            # 这里的逻辑是：用"时间坐标"去查询"Beat特征"
-            # 只有当 Beat 特征真正包含了完整的波形形态时，它才能正确回答每个时间点的数值
-            # Q: [B, Raw_Len, D] (时间坐标)
-            time_q = self.time_queries.repeat(B, 1, 1).to(x_token.device)
-            
-            # K, V: [B, K, D] (Beat 特征)
-            # 输出: [B, Raw_Len, D]
-            recon_feat, _ = self.recon_attn(time_q, z_beat, z_beat)
-            
-            # 映射回波形数值: [B, Raw_Len, 1] -> [B, Raw_Len]
-            x_recon = self.out_proj(recon_feat).squeeze(-1)
-            
-        return x_enhanced, x_recon
 
 
 class Decoder(nn.Module):
@@ -345,7 +365,6 @@ class TFCPR(nn.Module):
         )
         self.joint_bp_book = JointBPBook(num_slots=configs.num_slots, d_model=configs.d_model, topk=configs.topk)
         
-        # Decoder 
         self.decoder = Decoder(configs.d_model, configs.seq_len, configs.d_model*2, cwt_dim=configs.cwt_channels)
 
     def forward(self, x_enc):
@@ -355,8 +374,8 @@ class TFCPR(nn.Module):
         x_ppg_raw = x_enc[:, :, 3]
         
         # 1. Freq Features (FFT for Style, CWT for Details)
-        v_fft_ecg, m_cwt_ecg = self.freq_extractor(x_ecg, x_ecg_raw)
-        v_fft_ppg, m_cwt_ppg = self.freq_extractor(x_ppg, x_ppg_raw)
+        v_fft_ecg, m_cwt_ecg = self.freq_extractor(x_ecg_raw)
+        v_fft_ppg, m_cwt_ppg = self.freq_extractor(x_ppg_raw)
         v_style = torch.cat([v_fft_ecg, v_fft_ppg], dim=-1) # (B, 2D)
         
         # 2. Embedding

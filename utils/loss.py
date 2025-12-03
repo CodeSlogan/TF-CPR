@@ -41,21 +41,18 @@ def complex_loss(ecg_raw, ppg_raw, abp_raw,
     # 作用：确保输入端的 Tokenizer 学会了生理特征
     loss_almr = torch.tensor(0.0, device=abp_pred.device)
     if (ecg_pred is not None) and (ppg_pred is not None):
-        # 维度对齐与截断
         ecg_target = ecg_raw.squeeze(-1) if ecg_raw.dim() == 3 else ecg_raw
         ppg_target = ppg_raw.squeeze(-1) if ppg_raw.dim() == 3 else ppg_raw
         target_len = ecg_pred.shape[1]
         
-        # 简单的 MSE 约束特征重构
         loss_almr = F.mse_loss(ecg_pred, ecg_target[:, :target_len]) + \
                     F.mse_loss(ppg_pred, ppg_target[:, :target_len])
-
+    
     # ------------------------------------------------------
     # 2. 主任务：加权数值误差 (Weighted MSE)
     # ------------------------------------------------------
     if abp_raw.dim() == 3: abp_raw = abp_raw.squeeze(-1)
     
-    # 不平衡权重处理
     if target_weights is None:
         target_weights = torch.ones_like(abp_raw[:, 0]).unsqueeze(1) # [B, 1]
     
@@ -69,7 +66,6 @@ def complex_loss(ecg_raw, ppg_raw, abp_raw,
     # 3. 主任务：形态相关性 (Pearson Loss)
     # ------------------------------------------------------
     loss_pcc = _pearson_loss_fn(abp_pred, abp_raw)
-
 
     total_loss = (
         args.lambda_mse * loss_mse +   # 建议 1.0 (基准)

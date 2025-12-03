@@ -37,16 +37,16 @@ def get_args():
     parser.add_argument('--num_workers', type=int, default=4, help='DataLoader workers')
 
     # --- 2.2 Model Architecture ---
-    parser.add_argument('--topk', type=int, default=12, help='Top-K for BP-Book retrieval')
-    parser.add_argument('--num_slots', type=int, default=1024, help='Number of prototypes for BP-Book')
-    parser.add_argument("--cwt_channels", type=int, default=32, help="cwt channels")
+    parser.add_argument('--topk', type=int, default=4, help='Top-K for BP-Book retrieval')
+    parser.add_argument('--num_slots', type=int, default=2048, help='Number of prototypes for BP-Book')
+    parser.add_argument("--cwt_channels", type=int, default=64, help="cwt channels")
     parser.add_argument("--d_model", type=int, default=256, help="dimension of model")
-    parser.add_argument("--n_heads", type=int, default=4, help="num of heads")
-    parser.add_argument("--e_layers", type=int, default=3, help="num of encoder layers")
-    parser.add_argument("--d_ff", type=int, default=256, help="dimension of fcn")
+    parser.add_argument("--n_heads", type=int, default=8, help="num of heads")
+    parser.add_argument("--e_layers", type=int, default=6, help="num of encoder layers")
+    parser.add_argument("--d_ff", type=int, default=512, help="dimension of fcn")
     parser.add_argument("--factor", type=int, default=1, help="attn factor")
     parser.add_argument('--num_beats', type=int, default=16, help='Number of beats for TBR_ALMR_Module')
-    parser.add_argument("--dropout", type=float, default=0.2, help="dropout")
+    parser.add_argument("--dropout", type=float, default=0.1, help="dropout")
     parser.add_argument("--activation", type=str, default="gelu", help="activation")
     parser.add_argument(
         "--output_attention",
@@ -56,7 +56,7 @@ def get_args():
     parser.add_argument(
         "--patch_len_list",
         type=str,
-        default="8,8,8,16,16,16,32,32,32,64,64,64",
+        default="16,16,32,32,64,64,128,128",
         help="a list of patch len used in TFCPR",
     )
     parser.add_argument(
@@ -68,24 +68,24 @@ def get_args():
     parser.add_argument(
         "--augmentations",
         type=str,
-        default="flip,shuffle,jitter,mask,drop",
+        default="jitter,mask,drop,scale",
         help="a comma-seperated list of augmentation types (none, jitter or scale). Append numbers to specify the strength of the augmentation, e.g., jitter0.1",
     )
     
     # --- 2.3 Loss Function Weights (Lambdas) ---
-    parser.add_argument('--lambda_mse', type=float, default=1.0, help='Weight for MSE Loss')
+    parser.add_argument('--lambda_mse', type=float, default=1.5, help='Weight for MSE Loss')
     parser.add_argument('--lambda_almr', type=float, default=0.2, help='Weight for ALMR Self-Supervised Loss')
-    parser.add_argument('--lambda_pcc', type=float, default=0.8, help='Weight for Pearson Correlation Coefficient Loss')
+    parser.add_argument('--lambda_pcc', type=float, default=1.0, help='Weight for Pearson Correlation Coefficient Loss')
 
     # --- 2.4 Training Hyperparams ---
-    parser.add_argument('--batch_size', type=int, default=128, help='Batch size')
+    parser.add_argument('--batch_size', type=int, default=256, help='Batch size')
     parser.add_argument('--epochs', type=int, default=100, help='Number of epochs')
     parser.add_argument('--lr', type=float, default=0.0003, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='Weight decay')
-    parser.add_argument('--patience', type=int, default=50, help='Early stopping patience (epochs)') # New
+    parser.add_argument('--patience', type=int, default=15, help='Early stopping patience (epochs)') # New
     
     # --- 2.5 System ---
-    parser.add_argument('--seed', type=int, default=27, help='Random seed')
+    parser.add_argument('--seed', type=int, default=3407, help='Random seed')
     parser.add_argument('--device', type=str, default='cuda:1' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--save_path', type=str, default='./checkpoints/', help='Path to save models')
 
@@ -197,11 +197,16 @@ def train_mode(args, model, train_loader, val_loader, data_config):
     early_stopping = EarlyStopping(patience=args.patience, verbose=True, save_dir=args.save_path)
 
     print("Computing LDS weights...")
-    lds_calculator = LDSWeightCalculator(
+    lds_sbp_calculator = LDSWeightCalculator(
         all_train_labels=data_config.all_sbp_labels, 
         bucket_size=2.0, 
-        smoothing_sigma=2.0
+        smoothing_sigma=1.0
     ).to(args.device)
+    # lds_dbp_calculator = LDSWeightCalculator(
+    #     all_train_labels=data_config.all_dbp_labels, 
+    #     bucket_size=2.0,    
+    #     smoothing_sigma=1.0
+    # ).to(args.device)
 
     print("\n--- Start Training ---")
     for epoch in range(args.epochs):
@@ -224,12 +229,14 @@ def train_mode(args, model, train_loader, val_loader, data_config):
             abp_pred, recon_ecg, recon_ppg = model(torch.concat([ecg, ppg, ecg_raw, ppg_raw], dim=2))
 
             batch_sbp_val = abp_raw.max(dim=1)[0]
-            target_weights = lds_calculator.get_weights(batch_sbp_val)
+            target_weights_sbp = lds_sbp_calculator.get_weights(batch_sbp_val)
+            # batch_dbp_val = abp_raw.min(dim=1)[0]
+            # target_weights_dbp = lds_dbp_calculator.get_weights(batch_dbp_val)
 
             loss = complex_loss(
                 ecg.squeeze(2), ppg.squeeze(2), abp.squeeze(2), 
                 recon_ecg, recon_ppg, abp_pred,
-                args, target_weights=target_weights
+                args, target_weights=target_weights_sbp
             )
 
             loss.backward()
@@ -305,6 +312,7 @@ def main():
     if not os.path.exists(args.save_path):
         os.makedirs(args.save_path)
     
+    print(args)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     print(f"Running on device: {args.device}")
