@@ -37,13 +37,13 @@ def get_args():
     parser.add_argument('--num_workers', type=int, default=4, help='DataLoader workers')
 
     # --- 2.2 Model Architecture ---
-    parser.add_argument('--topk', type=int, default=4, help='Top-K for BP-Book retrieval')
+    parser.add_argument('--topk', type=int, default=8, help='Top-K for BP-Book retrieval')
     parser.add_argument('--num_slots', type=int, default=2048, help='Number of prototypes for BP-Book')
-    parser.add_argument("--cwt_channels", type=int, default=64, help="cwt channels")
+    parser.add_argument("--cwt_channels", type=int, default=32, help="cwt channels")
     parser.add_argument("--d_model", type=int, default=256, help="dimension of model")
     parser.add_argument("--n_heads", type=int, default=8, help="num of heads")
-    parser.add_argument("--e_layers", type=int, default=6, help="num of encoder layers")
-    parser.add_argument("--d_ff", type=int, default=512, help="dimension of fcn")
+    parser.add_argument("--e_layers", type=int, default=4, help="num of encoder layers")
+    parser.add_argument("--d_ff", type=int, default=1024, help="dimension of fcn")
     parser.add_argument("--factor", type=int, default=1, help="attn factor")
     parser.add_argument('--num_beats', type=int, default=16, help='Number of beats for TBR_ALMR_Module')
     parser.add_argument("--dropout", type=float, default=0.1, help="dropout")
@@ -56,7 +56,7 @@ def get_args():
     parser.add_argument(
         "--patch_len_list",
         type=str,
-        default="16,16,32,32,64,64,128,128",
+        default="16,32,64,128",
         help="a list of patch len used in TFCPR",
     )
     parser.add_argument(
@@ -68,25 +68,26 @@ def get_args():
     parser.add_argument(
         "--augmentations",
         type=str,
-        default="jitter,mask,drop,scale",
+        default="none",
         help="a comma-seperated list of augmentation types (none, jitter or scale). Append numbers to specify the strength of the augmentation, e.g., jitter0.1",
     )
     
     # --- 2.3 Loss Function Weights (Lambdas) ---
-    parser.add_argument('--lambda_mse', type=float, default=1.5, help='Weight for MSE Loss')
-    parser.add_argument('--lambda_almr', type=float, default=0.2, help='Weight for ALMR Self-Supervised Loss')
+    parser.add_argument('--lambda_mse', type=float, default=1.2, help='Weight for MSE Loss')
+    parser.add_argument('--lambda_almr', type=float, default=0, help='Weight for ALMR Self-Supervised Loss')
     parser.add_argument('--lambda_pcc', type=float, default=1.0, help='Weight for Pearson Correlation Coefficient Loss')
+    parser.add_argument('--lambda_bp', type=float, default=0, help='Weight for SBP/DBP Loss')
 
     # --- 2.4 Training Hyperparams ---
-    parser.add_argument('--batch_size', type=int, default=256, help='Batch size')
+    parser.add_argument('--batch_size', type=int, default=512, help='Batch size')
     parser.add_argument('--epochs', type=int, default=100, help='Number of epochs')
-    parser.add_argument('--lr', type=float, default=0.0003, help='Learning rate')
+    parser.add_argument('--lr', type=float, default=0.0005, help='Learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='Weight decay')
     parser.add_argument('--patience', type=int, default=15, help='Early stopping patience (epochs)') # New
     
     # --- 2.5 System ---
-    parser.add_argument('--seed', type=int, default=3407, help='Random seed')
-    parser.add_argument('--device', type=str, default='cuda:1' if torch.cuda.is_available() else 'cpu')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed')
+    parser.add_argument('--device', type=str, default='cuda:2' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--save_path', type=str, default='./checkpoints/', help='Path to save models')
 
     return parser.parse_args()
@@ -111,12 +112,12 @@ def validate(model, dataloader, args, config: DataConfig, prefix="Validating"):
             abp_raw = batch['abp_raw'].to(args.device).permute(0, 2, 1)
 
             # 模型推理
-            abp_pred, recon_ecg, recon_ppg = model(torch.concat([ecg, ppg, ecg_raw, ppg_raw], dim=2))
+            abp_pred, recon_ecg, recon_ppg, pred_sbp, pred_dbp = model(torch.concat([ecg, ppg, ecg_raw, ppg_raw], dim=2))
 
             # 计算损失
             loss = complex_loss(
                 ecg.squeeze(2), ppg.squeeze(2), abp.squeeze(2), 
-                recon_ecg, recon_ppg, abp_pred,
+                recon_ecg, recon_ppg, abp_pred, pred_sbp, pred_dbp,
                 args
             )
             total_loss += loss.item()
@@ -129,27 +130,53 @@ def validate(model, dataloader, args, config: DataConfig, prefix="Validating"):
             
             pred_mmhg_np = pred_mmhg.detach().cpu().numpy()
             target_mmhg_np = target_mmhg.detach().cpu().numpy()
-            
-            # ===
+            ecg_np = ecg.squeeze(2).detach().cpu().numpy()  # [batch_size, time_steps]
+            ppg_np = ppg.squeeze(2).detach().cpu().numpy()  # [batch_size, time_steps]
+
+            # ========== 保存目录 ==========
             save_dir = 'vis_results'
             os.makedirs(save_dir, exist_ok=True)
-            
-            plt.figure(figsize=(12, 4))
-            # 取 batch 中的第一个样本 [0] 进行绘制
-            plt.plot(target_mmhg_np[0], label='Target (Ground Truth)', color='black', alpha=0.6, linewidth=1.5)
-            plt.plot(pred_mmhg_np[0], label='Prediction', color='red', alpha=0.8, linewidth=1.5)
-            
-            plt.title(f'ABP Waveform Comparison - Step {steps}')
-            plt.xlabel('Time Points')
-            plt.ylabel('ABP (mmHg)')
-            plt.legend(loc='upper right')
+
+            # ========== 核心修改：3*1子图布局 ==========
+            plt.figure(figsize=(12, 9))  # 调整画布尺寸，3行图需要更大的高度
+
+            # 第1个子图：ECG Raw信号
+            plt.subplot(3, 1, 1)
+            plt.plot(ecg_np[0], label='ECG Raw', color='#1f77b4', linewidth=1.0)
+            plt.title('ECG Raw Signal', fontsize=10, fontweight='bold')
+            plt.ylabel('Amplitude', fontsize=9)
+            plt.legend(loc='upper right', fontsize=8)
             plt.grid(True, linestyle='--', alpha=0.5)
-            
+            plt.tick_params(axis='both', labelsize=8)
+
+            # 第2个子图：PPG Raw信号
+            plt.subplot(3, 1, 2)
+            plt.plot(ppg_np[0], label='PPG Raw', color='#2ca02c', linewidth=1.0)
+            plt.title('PPG Raw Signal', fontsize=10, fontweight='bold')
+            plt.ylabel('Amplitude', fontsize=9)
+            plt.legend(loc='upper right', fontsize=8)
+            plt.grid(True, linestyle='--', alpha=0.5)
+            plt.tick_params(axis='both', labelsize=8)
+
+            # 第3个子图：ABP预测vs真实值（原有逻辑）
+            plt.subplot(3, 1, 3)
+            plt.plot(target_mmhg_np[0], label='Target (Ground Truth)', color='black', alpha=0.6, linewidth=1.5)
+            plt.plot(pred_mmhg_np[0], label='Prediction', color='#d62728', alpha=0.8, linewidth=1.5)
+            plt.title('ABP Prediction vs Ground Truth', fontsize=10, fontweight='bold')
+            plt.xlabel('Time Points', fontsize=9)
+            plt.ylabel('ABP (mmHg)', fontsize=9)
+            plt.legend(loc='upper right', fontsize=8)
+            plt.grid(True, linestyle='--', alpha=0.5)
+            plt.tick_params(axis='both', labelsize=8)
+
+            # 调整子图间距，避免标题/标签重叠
+            plt.subplots_adjust(hspace=0.4, top=0.95, bottom=0.05, left=0.08, right=0.95)
+
             # 保存图片
             save_path = os.path.join(save_dir, f'step_{steps}_comp.png')
-            plt.savefig(save_path, dpi=100, bbox_inches='tight')
-            
-            # 关键：不显示并关闭画布以释放内存
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')  # 提高dpi让图片更清晰
+
+            # 关闭画布释放内存
             plt.close()
 
             # ====
@@ -226,7 +253,7 @@ def train_mode(args, model, train_loader, val_loader, data_config):
             
             optimizer.zero_grad()
             
-            abp_pred, recon_ecg, recon_ppg = model(torch.concat([ecg, ppg, ecg_raw, ppg_raw], dim=2))
+            abp_pred, recon_ecg, recon_ppg, pred_sbp, pred_dbp = model(torch.concat([ecg, ppg, ecg_raw, ppg_raw], dim=2))
 
             batch_sbp_val = abp_raw.max(dim=1)[0]
             target_weights_sbp = lds_sbp_calculator.get_weights(batch_sbp_val)
@@ -235,7 +262,7 @@ def train_mode(args, model, train_loader, val_loader, data_config):
 
             loss = complex_loss(
                 ecg.squeeze(2), ppg.squeeze(2), abp.squeeze(2), 
-                recon_ecg, recon_ppg, abp_pred,
+                recon_ecg, recon_ppg, abp_pred, pred_sbp, pred_dbp, 
                 args, target_weights=target_weights_sbp
             )
 

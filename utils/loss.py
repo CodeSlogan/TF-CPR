@@ -26,27 +26,11 @@ class NegPearsonLoss(nn.Module):
 
 _pearson_loss_fn = NegPearsonLoss()
 
-def complex_loss(ecg_raw, ppg_raw, abp_raw, 
-                            ecg_pred, ppg_pred, abp_pred, 
-                            args,
-                            target_weights=None):
+def complex_loss(abp_raw, abp_pred, args, target_weights=None):
     """
     极简版 SOTA 损失函数
     保留三要素：加权绝对误差 + 形状相关性 + 自监督辅助
     """
-    
-    # ------------------------------------------------------
-    # 1. ALMR 辅助任务 (Auxiliary Loss)
-    # ------------------------------------------------------
-    # 作用：确保输入端的 Tokenizer 学会了生理特征
-    loss_almr = torch.tensor(0.0, device=abp_pred.device)
-    if (ecg_pred is not None) and (ppg_pred is not None):
-        ecg_target = ecg_raw.squeeze(-1) if ecg_raw.dim() == 3 else ecg_raw
-        ppg_target = ppg_raw.squeeze(-1) if ppg_raw.dim() == 3 else ppg_raw
-        target_len = ecg_pred.shape[1]
-        
-        loss_almr = F.mse_loss(ecg_pred, ecg_target[:, :target_len]) + \
-                    F.mse_loss(ppg_pred, ppg_target[:, :target_len])
     
     # ------------------------------------------------------
     # 2. 主任务：加权数值误差 (Weighted MSE)
@@ -68,9 +52,8 @@ def complex_loss(ecg_raw, ppg_raw, abp_raw,
     loss_pcc = _pearson_loss_fn(abp_pred, abp_raw)
 
     total_loss = (
-        args.lambda_mse * loss_mse +   # 建议 1.0 (基准)
-        args.lambda_pcc * loss_pcc +   # 建议 0.5 - 1.0 (形状约束)
-        args.lambda_almr * loss_almr   # 建议 0.1 (辅助约束)
+        args.lambda_mse * loss_mse +   
+        args.lambda_pcc * loss_pcc 
     )
 
     return total_loss

@@ -9,7 +9,7 @@ import math
 class MultiScaleConv(nn.Module):
     """
     [SOTA] 可学习的 Morlet 小波变换层
-    不使用随机初始化的 Conv1d，而是基于物理公式生成 Morlet 小波核。
+    不使用随机初始化的 Conv1d, 而是基于物理公式生成 Morlet 小波核。
     允许模型微调小波的形状，以适应具体的血压任务。
     """
     def __init__(self, in_channels, out_channels, kernel_size=63):
@@ -276,7 +276,7 @@ class Decoder(nn.Module):
 
 class JointBPBook(nn.Module):
     """
-    [最佳实践] 联合生理状态字典
+    联合生理状态字典
     存储 (ECG特征 + PPG特征 + PTT关系) 的联合高维原型
     """
     def __init__(self, num_slots=2048, d_model=128, topk=5):
@@ -285,7 +285,7 @@ class JointBPBook(nn.Module):
         self.topk = topk
         
         self.memory = nn.Parameter(torch.randn(num_slots, d_model))
-        self.retrieval_scale = nn.Parameter(torch.tensor(0.1))
+        self.retrieval_scale = nn.Parameter(torch.tensor(1.0))
         
         self.query_proj = nn.Linear(d_model, d_model)
 
@@ -338,9 +338,8 @@ class TFCPR(nn.Module):
         self.freq_extractor = FreqFeatureExtractor(configs.seq_len, configs.d_model, configs.cwt_channels)
         
         # ALMR
-        total_patches = sum([int((configs.seq_len - pl) / pl + 2) for pl in patch_len_list])
-        self.tbr_ecg = ALMR_Module(configs.d_model, configs.seq_len, configs.num_beats)
-        self.tbr_ppg = ALMR_Module(configs.d_model, configs.seq_len, configs.num_beats)
+        # self.tbr_ecg = ALMR_Module(configs.d_model, configs.seq_len, configs.num_beats)
+        # self.tbr_ppg = ALMR_Module(configs.d_model, configs.seq_len, configs.num_beats)
         
         self.ecg_encoder = Encoder(
             [EncoderLayer(
@@ -366,6 +365,9 @@ class TFCPR(nn.Module):
         self.joint_bp_book = JointBPBook(num_slots=configs.num_slots, d_model=configs.d_model, topk=configs.topk)
         
         self.decoder = Decoder(configs.d_model, configs.seq_len, configs.d_model*2, cwt_dim=configs.cwt_channels)
+        self.sbp_head = nn.Linear(configs.d_model, 1)
+        self.dbp_head = nn.Linear(configs.d_model, 1)
+
 
     def forward(self, x_enc):
         x_ecg = x_enc[:, :, 0] 
@@ -386,8 +388,8 @@ class TFCPR(nn.Module):
         h_ecg_enc, _ = self.ecg_encoder(h_ecg)
         h_ppg_enc, _ = self.ppg_encoder(h_ppg)
 
-        h_ecg_enc, recon_ecg = self.tbr_ecg(h_ecg_enc, self.is_train)
-        h_ppg_enc, recon_ppg = self.tbr_ppg(h_ppg_enc, self.is_train)
+        # h_ecg_enc, recon_ecg = self.tbr_ecg(h_ecg_enc, self.is_train)
+        # h_ppg_enc, recon_ppg = self.tbr_ppg(h_ppg_enc, self.is_train)
         
         # 4. Cross Fusion
         h_ecg_to_ppg, _ = self.cross_ecg_to_ppg(h_ecg_enc, h_ppg_enc, h_ppg_enc, attn_mask=None)
@@ -398,9 +400,13 @@ class TFCPR(nn.Module):
         fused_calibrated = self.joint_bp_book(h_fused)
         
         # 5. Decoder 
-        abp_pred = self.decoder(fused_calibrated, v_style, m_cwt_ecg, m_cwt_ppg) 
-        
+        abp_pred = self.decoder(fused_calibrated, v_style, m_cwt_ecg, m_cwt_ppg)
+        feat_global = fused_calibrated.mean(dim=1)
+        pred_sbp = self.sbp_head(feat_global)
+        pred_dbp = self.dbp_head(feat_global) 
+
         if self.is_train:
-            return abp_pred, recon_ecg, recon_ppg
+            # return abp_pred, recon_ecg, recon_ppg, pred_sbp, pred_dbp
+            return abp_pred, None, None, pred_sbp, pred_dbp
         else:
             return abp_pred
